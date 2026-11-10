@@ -1,0 +1,25 @@
+# environment and upstream checkouts
+.venv/
+ComfyUI/
+__pycache__/
+*.pyc
+
+# model weights (base models live on /common, LoRAs in models/loras)
+models/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# runtime scratch and logs
+.comfy_tmp/
+outputs/
+*.log
+
+# per-case media: personal photos, source videos and generated results stay local
+cases/*/input/
+cases/*/output/
+
+# third-party material (not ours to redistribute)
+third_party_review/
+legacy/workflows/

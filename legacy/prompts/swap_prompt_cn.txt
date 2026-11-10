@@ -1,0 +1,5 @@
+Replace the selected person in <Video 1> with the {character_noun} in <Picture 1>.{character_desc_sentence}
+Keep the reference character's face, hair and clothing.
+Follow the source performance's pose, gaze and every movement exactly, frame by frame.
+Keep the source performance's facial expression exactly: {emotion}.
+Preserve the scene, the lighting, the camera motion and the other people.
