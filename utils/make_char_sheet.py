@@ -3,7 +3,7 @@
 the outfit from the video, rendered from several angles on white. The views become MiniMax H3 references
 (CHAR_REF + CHAR_REF_EXTRA in run_swap.sh), so BFS sees the identity and the outfit from front, side and back.
 
-  python make_char_sheet.py --person cases/x/input/full_body_cutout.png --outfit cases/x/input/outfit_ref.jpg \
+  python utils/make_char_sheet.py --person cases/x/input/full_body_cutout.png --outfit cases/x/input/outfit_ref.jpg \
       --face cases/x/input/face_cutout.png --out cases/x/input/sheet
 Writes <out>/view_<name>.png per angle and <out>/sheet.png (all views side by side, for viewing).
 """
@@ -19,9 +19,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent   # project root
 sys.path.insert(0, str(ROOT))
-import comfy_client as cs  # noqa: E402
+from utils import comfy_client as cs  # noqa: E402
 
 VIEWS = {   # name -> camera description (Chinese, like the model's own multi-reference examples)
     "front": "正面视角，人物面向镜头",

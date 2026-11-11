@@ -5,7 +5,7 @@ BFS copies the framing of its reference: a face selfie turns every shot into a f
 short clip of the person (<Picture 1> = face photo) standing full body on a plain white background, in the outfit
 you describe, and saves its frames; pick the best one as CHAR_REF.
 
-  python make_fullbody_ref.py --face cases/x/input/face_cutout.png --outfit "red floral kimono ..." \
+  python utils/make_fullbody_ref.py --face cases/x/input/face_cutout.png --outfit "red floral kimono ..." \
       --out cases/x/input/fullbody --seeds 1,2,3
 """
 from __future__ import annotations
@@ -16,9 +16,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent   # project root
 sys.path.insert(0, str(ROOT))
-import comfy_client as cs  # noqa: E402
+from utils import comfy_client as cs  # noqa: E402
 
 PROMPT = ("r34l1sm, full-body studio photo of the woman shown in <Picture 1>: exactly her face, identity, hairstyle, "
           "hair color and bangs. She stands still facing the camera, whole body visible from head to feet, arms "

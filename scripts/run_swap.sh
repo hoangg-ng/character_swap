@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Character swap for one case: replace ONE chosen person in a video with a character, keep everything else.
 #
-#   CASE=cases/<name> bash run_swap.sh            # settings from cases/<name>/case.env
-#   CASE=cases/<name> SEED=7 RES=720 bash run_swap.sh   # any setting can be overridden on the command line
+#   CASE=cases/<name> bash scripts/run_swap.sh            # settings from cases/<name>/case.env
+#   CASE=cases/<name> SEED=7 RES=720 bash scripts/run_swap.sh   # any setting can be overridden on the command line
 #
 # A case folder:  cases/<name>/input/   video, character image(s), target face crop, ...
 #                 cases/<name>/case.env settings (paths relative to the case folder)
@@ -12,7 +12,7 @@
 #   VIDEO         source video (any size / fps; shots are converted to 24 fps for generation)
 #   CUTS          shot boundaries in source frames, "a,b,c" or "auto" (PySceneDetect)            [auto]
 #   CHAR_REF      the new character (best: full body cut-out on white)
-#   CHAR_REF_EXTRA  more views of the same character (character sheet, make_char_sheet.py), space-separated;
+#   CHAR_REF_EXTRA  more views of the same character (character sheet, utils/make_char_sheet.py), space-separated;
 #                   each becomes another H3 reference <Picture 2..N>                                  [""]
 #   CHAR_DETAILS  head-to-toe description of the character, starting with gender
 #   TARGET_FACE   face crop of the person to REPLACE. Each shot is generated only where this identity is
@@ -41,7 +41,7 @@
 #   ASSEMBLE_ONLY=1           re-assemble $JOB without generating;  CHECK_ONLY=1  print the target check only
 #   JOB (gen_seed$SEED), OUT (final_seed$SEED)   folder names under the case's output/
 set -u
-R=/research/cbim/vast/hn315/char_swap; cd "$R"; PY="$R/.venv/bin/python"
+R="$(cd "$(dirname "$0")/.." && pwd)"; cd "$R"; PY="$R/.venv/bin/python"
 CASE=${CASE:?set CASE=cases/<name>}; CASE=$(cd "$CASE" && pwd)
 set -a; . "$CASE/case.env"; set +a                # case.env uses ${VAR:-default}, so the environment wins
 abspath() { case "$1" in /*|"") echo "$1";; *) echo "$CASE/$1";; esac; }

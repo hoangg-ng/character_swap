@@ -66,7 +66,7 @@ def write(frames: list, path: Path, fps: float = 24.0, audio_from: Path | None =
 def make_target_ref(frames: list, text: str, out: Path, url: str) -> Path | None:
     """SAM-detect `text` on the clearest real frame (largest detection) and save her cut-out on white."""
     sys.path.insert(0, str(ROOT))
-    import comfy_client as cs
+    from utils import comfy_client as cs
     out.parent.mkdir(parents=True, exist_ok=True)
     picks = [frames[k] for k in sorted({0, len(frames) // 3, len(frames) // 2, (2 * len(frames)) // 3})]
     found = []            # (frame, mask, area) per pick, in time order
@@ -114,7 +114,7 @@ def make_clean_guide(inp: Path, hide: str, thr: float, out: Path, url: str) -> P
     person. Only the guide changes; the source video is untouched."""
     sys.path.insert(0, str(ROOT))
     import shutil
-    import comfy_client as cs
+    from utils import comfy_client as cs
     name = f"hide_{inp.parent.name}_{inp.stem}.mp4"
     shutil.copy2(inp, ROOT / "ComfyUI" / "input" / name)
     wf = {"v": {"class_type": "LoadVideo", "inputs": {"file": name}},

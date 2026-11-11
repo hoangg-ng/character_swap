@@ -6,7 +6,7 @@ the original is in shadow). For each frame: YOLO11 finds the person in the sourc
 frame; inside the generated person's box the LAB channels are shifted/scaled to the source person's statistics
 (Reinhard transfer), blended by --strength through a feathered box mask. Only the person region changes.
 
-  python tone_match.py --src shot_in.mp4 --gen save_*.mp4 --out toned.mp4 [--strength 0.8]
+  python utils/tone_match.py --src shot_in.mp4 --gen save_*.mp4 --out toned.mp4 [--strength 0.8]
 Used by assemble_bfs.py --tone-person.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent   # project root
 _MODEL = None
 
 

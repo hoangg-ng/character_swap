@@ -25,9 +25,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import queue
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent   # project root
 sys.path.insert(0, str(ROOT))
-import comfy_client as cs  # noqa: E402
+from utils import comfy_client as cs  # noqa: E402
 
 PROMPT = ("{trigger}Close-up of <Subject 1>, the young woman shown in <Picture 1>: same face, same identity, fair skin "
           "with natural texture and fine pores, dark brown eyes, small nose, soft pink lips, long straight wine-red "

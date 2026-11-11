@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Launch a ComfyUI backend for the pipeline (run_swap.sh uses ports 8188-8190, one per GPU).
-# Usage: GPU=1,2 PORT=8188 bash start_comfy.sh   (nvidia-smi numbering)
+# Usage: GPU=1,2 PORT=8188 bash scripts/start_comfy.sh   (nvidia-smi numbering)
 # Pick a 48 GB A6000 (the 20 GB A4500 is too small even with offloading).
 set -euo pipefail
-mkdir -p "$(cd "$(dirname "$0")" && pwd)/.comfy_tmp"
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "$ROOT/.comfy_tmp"
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID          # GPU ids == nvidia-smi indices

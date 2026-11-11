@@ -123,7 +123,7 @@ def main() -> None:
             how = "SAM-mask composite" if masks else ("man restored from source" if prot else "raw (no composite)")
             log[i] = f"{gen_p} | lead {lead} | {how}"
             if args.tone_person > 0:
-                import tone_match as tm
+                from utils import tone_match as tm
                 srcs = [cv2.resize(srcin[min(k, len(srcin) - 1)], (OW, OH)) for k in range(lead, lead + n)]
                 lg, ls = [], []
                 for f, sf in list(zip(frames, srcs))[::6]:           # sample: person lightness, generated vs source
