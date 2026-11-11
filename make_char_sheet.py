@@ -10,6 +10,7 @@ Writes <out>/view_<name>.png per angle and <out>/sheet.png (all views side by si
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -20,14 +21,14 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-import character_swap as cs  # noqa: E402
+import comfy_client as cs  # noqa: E402
 
 VIEWS = {   # name -> camera description (Chinese, like the model's own multi-reference examples)
     "front": "正面视角，人物面向镜头",
-    "front_left": "左前方45度视角，人物身体转向画面左侧，脸部仍然可见",
-    "left": "左侧面视角，人物完全侧身朝向画面左侧，可见侧脸轮廓",
-    "back": "背面视角，人物背对镜头，看不到脸，可见后脑的发型和服装背面",
-    "front_right": "右前方45度视角，人物身体转向画面右侧，脸部仍然可见",
+    "front_left": "相机向右绕人物转45度：人物的身体、脸和脚尖都朝向画面左前方，呈四分之三侧面，能看到她的右侧脸和右肩",
+    "left": "相机绕人物转90度，拍摄完全的侧面：人物的身体、脸和脚尖都朝向画面左侧，只看到她的侧脸轮廓、一只眼睛和身体侧面",
+    "back": "相机绕到人物正后方拍摄：画面中只看到人物的后背、后脑勺和背后的头发，完全看不到脸和身体正面，脚跟朝向镜头",
+    "front_right": "相机向左绕人物转45度：人物的身体、脸和脚尖都朝向画面右前方，呈四分之三侧面",
 }
 
 # stage 1: dress the person (one image, front view). Image 2 is the garment only (head cropped off).
@@ -37,6 +38,12 @@ DRESS = ("图1提供人物身份（五官、脸型、发型、发色和体型）
          "保持图1和图3人物的五官、发型和发色不变。人物自然站立，双臂自然下垂，从头到脚完整入镜，"
          "纯白色背景，柔和均匀的影棚光，写实照片。\n\n"
          "每张输入图只提供指定的信息，不引入其余背景或物体。只生成一个人物。输出一张完整图片。")
+# stage 1 without an outfit image: keep the person's own clothes, just a clean neutral front view.
+NEUTRAL = ("图1提供人物（五官、脸型、发型、发色、体型和服装），图2提供面部细节。"
+           "画面中只有一个人：生成图1人物的全身照，{view}，穿着图1中她自己的服装（保持款式、剪裁、花纹和颜色）。"
+           "保持图1和图2人物的五官、发型和发色不变。人物自然站立，双臂自然下垂放在身体两侧，手中不拿任何物品，"
+           "从头到脚完整入镜，纯白色背景，柔和均匀的影棚光，写实照片。\n\n"
+           "每张输入图只提供指定的信息，不引入其余背景或物体。只生成一个人物。输出一张完整图片。")
 # stage 2: the same person and outfit from another camera angle (image 1 = stage-1 result).
 ROTATE = ("图1是一个人物的全身照。生成同一个人物、同一套服装的全身照，改为{view}。"
           "保持图1人物的五官、发型、发色、体型以及服装的款式、花纹、颜色和穿法完全不变，只改变相机角度。"
@@ -74,10 +81,11 @@ def build(images: list, prompt: str, seed: int, prefix: str) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--person", type=Path, required=True, help="full-body photo of the character (cut-out on white)")
-    ap.add_argument("--outfit", type=Path, required=True, help="image of the outfit to wear (e.g. a video frame)")
+    ap.add_argument("--outfit", type=Path, default=None,
+                    help="image of the outfit to wear (e.g. a video crop without the head); omit to keep her own clothes")
     ap.add_argument("--face", type=Path, required=True, help="face close-up of the character")
     ap.add_argument("--outfit-text", default="红色和服，红白相间的波浪花纹，单肩露出，宽大的白色衣领，花纹腰带，垂下的黄色系带")
-    ap.add_argument("--views", default=",".join(VIEWS))
+    ap.add_argument("--views", default="front,front_left,left,back")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--reuse-front", action="store_true", help="keep an existing <out>/view_front.png (stage 1)")
     ap.add_argument("--out", type=Path, required=True)
@@ -87,7 +95,9 @@ def main() -> None:
     inp = ROOT / "ComfyUI" / "input"
     names = {}
     for key, p in (("p", args.person), ("o", args.outfit), ("f", args.face)):
-        names[key] = f"sheet_{key}{p.suffix}"
+        if p is None:
+            continue
+        names[key] = f"sheet_{os.getpid()}_{key}{p.suffix}"
         shutil.copy2(p, inp / names[key])
     urls = args.comfy_urls.split(",")
     views = [v for v in args.views.split(",") if v != "front"]
@@ -108,9 +118,12 @@ def main() -> None:
     # stage 1: front view, dressed
     front = args.out / "view_front.png"
     if not (args.reuse_front and front.exists()):
-        front = gen(0, [names["p"], names["o"], names["f"]], DRESS.format(view=VIEWS["front"], outfit=args.outfit_text),
-                    "front")
-    names["front"] = "sheet_front.png"
+        if args.outfit:
+            front = gen(0, [names["p"], names["o"], names["f"]],
+                        DRESS.format(view=VIEWS["front"], outfit=args.outfit_text), "front")
+        else:
+            front = gen(0, [names["p"], names["f"]], NEUTRAL.format(view=VIEWS["front"]), "front")
+    names["front"] = f"sheet_{os.getpid()}_front.png"
     shutil.copy2(front, inp / names["front"])
     # stage 2: rotate the dressed front view
     with ThreadPoolExecutor(len(urls)) as ex:

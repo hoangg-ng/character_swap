@@ -27,7 +27,7 @@ import queue
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-import character_swap as cs  # noqa: E402  (Comfy client)
+import comfy_client as cs  # noqa: E402
 
 PROMPT = ("{trigger}Close-up of <Subject 1>, the young woman shown in <Picture 1>: same face, same identity, fair skin "
           "with natural texture and fine pores, dark brown eyes, small nose, soft pink lips, long straight wine-red "

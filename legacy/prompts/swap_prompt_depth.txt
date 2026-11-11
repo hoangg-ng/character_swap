@@ -1,5 +1,0 @@
-Replace the selected person in <Video 1> with the {character_noun} in <Picture 1>.{character_desc_sentence}
-In <Video 1> the selected person is shown only as a grayscale depth map with a face-mesh overlay. Follow the depth map exactly for her body pose, silhouette and every movement, frame by frame.
-Follow the face mesh exactly for her head turn, gaze and facial expression: the shape of the eyes, eyebrows and mouth, showing {emotion}.
-Render her as a real person with the reference character's face, hair and clothing, lit like the scene. Never show the depth map or mesh lines.
-Preserve the scene, the lighting, the camera motion and the other people.

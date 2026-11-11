@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-import character_swap as cs  # noqa: E402
+import comfy_client as cs  # noqa: E402
 
 PROMPT = ("r34l1sm, full-body studio photo of the woman shown in <Picture 1>: exactly her face, identity, hairstyle, "
           "hair color and bangs. She stands still facing the camera, whole body visible from head to feet, arms "

@@ -66,7 +66,7 @@ def write(frames: list, path: Path, fps: float = 24.0, audio_from: Path | None =
 def make_target_ref(frames: list, text: str, out: Path, url: str) -> Path | None:
     """SAM-detect `text` on the clearest real frame (largest detection) and save her cut-out on white."""
     sys.path.insert(0, str(ROOT))
-    import character_swap as cs
+    import comfy_client as cs
     out.parent.mkdir(parents=True, exist_ok=True)
     picks = [frames[k] for k in sorted({0, len(frames) // 3, len(frames) // 2, (2 * len(frames)) // 3})]
     found = []            # (frame, mask, area) per pick, in time order
@@ -114,7 +114,7 @@ def make_clean_guide(inp: Path, hide: str, thr: float, out: Path, url: str) -> P
     person. Only the guide changes; the source video is untouched."""
     sys.path.insert(0, str(ROOT))
     import shutil
-    import character_swap as cs
+    import comfy_client as cs
     name = f"hide_{inp.parent.name}_{inp.stem}.mp4"
     shutil.copy2(inp, ROOT / "ComfyUI" / "input" / name)
     wf = {"v": {"class_type": "LoadVideo", "inputs": {"file": name}},
@@ -187,20 +187,33 @@ def target_presence(video: Path, shots: list, face: Path | None, sex: str, sim: 
     return out
 
 
-def person_frames(video: Path, conf: float = 0.35, min_area: float = 0.005) -> list:
-    """Per source frame: 1 if YOLO11 sees a person (body box >= min_area of the frame) - catches backs,
-    silhouettes and partial bodies that face detection misses."""
+def person_frames(video: Path, conf: float = 0.35, min_area: float = 0.005, kp_conf: float = 0.5) -> tuple:
+    """Per source frame: (person, head).
+    person: YOLO11 detection, a body box >= min_area of the frame (catches backs, silhouettes, partial bodies);
+            this defines the with/without segments.
+    head:   YOLO11-pose, any head keypoint (nose, eyes, ears) with kp_conf - also works from behind. Body parts
+            alone (a kimono hem, a sleeve) give person=1, head=0."""
     from ultralytics import YOLO
-    model = YOLO(str(ROOT / "ComfyUI" / "models" / "ultralytics" / "person" / "yolo11m.pt"))
-    cap, out = cv2.VideoCapture(str(video)), []
+    d = ROOT / "ComfyUI" / "models" / "ultralytics" / "person"
+    det, pose = YOLO(str(d / "yolo11m.pt")), YOLO(str(d / "yolo11m-pose.pt"))
+    cap, person, head, light = cv2.VideoCapture(str(video)), [], [], []
     while True:
         ok, fr = cap.read()
         if not ok:
             break
-        r = model.predict(fr, classes=[0], conf=conf, verbose=False, device="cpu")[0]
         area = fr.shape[0] * fr.shape[1]
-        out.append(int(any((b[2] - b[0]) * (b[3] - b[1]) / area >= min_area for b in r.boxes.xyxy.tolist())))
-    return out
+        r = det.predict(fr, classes=[0], conf=conf, verbose=False, device="cpu")[0]
+        boxes = [b for b in r.boxes.xyxy.tolist() if (b[2] - b[0]) * (b[3] - b[1]) / area >= min_area]
+        person.append(int(bool(boxes)))
+        if boxes:                                    # median brightness inside the largest person box
+            x0, y0, x1, y1 = map(int, max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1])))
+            light.append(float(np.median(cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY))))
+        else:
+            light.append(-1.0)
+        k = pose.predict(fr, conf=0.3, verbose=False, device="cpu")[0].keypoints
+        k = k.conf if k is not None else None
+        head.append(int(k is not None and len(k) > 0 and bool((k[:, :5] > kp_conf).any())))
+    return person, head, light
 
 
 def split_by_presence(bounds: list, pf: list, gap: int, min_run: int, min_seg: int) -> tuple:
@@ -260,9 +273,15 @@ def main() -> None:
                     help="image of the face of the person to REPLACE (screenshot crop); shots are generated only "
                          "where this identity is visible")
     ap.add_argument("--target-sex", default="F", help="fallback target check without --target-face: F or M")
-    ap.add_argument("--presence", default="face", choices=["face", "person"],
+    ap.add_argument("--min-person-light", type=float, default=6.0,
+                    help="presence=head: segments whose person is darker than this (median, 0-255) are silhouettes "
+                         "and stay source")
+    ap.add_argument("--min-head", type=float, default=0.3,
+                    help="presence=head: a segment is generated only if the head is seen in this fraction of it")
+    ap.add_argument("--presence", default="face", choices=["face", "person", "head"],
                     help="face: target identity/sex must be seen (multi-person videos); person: any person visible "
-                         "(single-person videos: also back views, silhouettes, partial bodies)")
+                         "(single-person videos: also back views, silhouettes, partial bodies); head: like person, but segments "
+                         "showing only body parts (hem, sleeve) stay source - nothing there to swap")
     ap.add_argument("--face-sim", type=float, default=0.35, help="ArcFace cosine needed to count as the target")
     ap.add_argument("--keep-outfit", action="store_true", help="face-only reference: keep the guide's clothing")
     ap.add_argument("--face-only", action="store_true", help="swap only the face (combine with --subject face)")
@@ -307,16 +326,28 @@ def main() -> None:
     keep = {int(k) for k in args.keep.split(",") if k}
     (OUT_ROOT / args.job).mkdir(parents=True, exist_ok=True)
     (OUT_ROOT / args.job / "cuts.txt").write_text(args.cuts + "\n")    # for assemble_bfs.py
-    if args.min_target > 0 and args.presence == "person":
-        pf = person_frames(args.video)
+    if args.min_target > 0 and args.presence in ("person", "head"):
+        pf, hf, lf = person_frames(args.video)
         b, flag = split_by_presence(b, pf, gap=int(round(FPS_SRC * 0.5)), min_run=2, min_seg=4)
         shots = [(b[i], b[i + 1]) for i in range(len(b) - 1)]
         args.cuts = ",".join(str(x) for x in b[1:-1])
         (OUT_ROOT / args.job / "cuts.txt").write_text(args.cuts + "\n")
         print(f"segments with/without the person: cuts {args.cuts}", flush=True)
+        if args.presence == "head":                    # keep body-part-only segments (no head) as source
+            for i, (a, e) in enumerate(shots, 1):
+                hfrac = sum(hf[a:e]) / max(1, e - a)
+                if flag.get(i) and hfrac < args.min_head:
+                    print(f"segment {i}: person but head in only {hfrac:.0%} of frames -> body parts only, keep",
+                          flush=True)
+                    flag[i] = False
+            for i, (a, e) in enumerate(shots, 1):         # silhouettes: identity invisible, keep the original look
+                lv = [x for x in lf[a:e] if x >= 0]
+                if flag.get(i) and lv and float(np.mean(lv)) < args.min_person_light:
+                    print(f"segment {i}: person median brightness {np.mean(lv):.1f} -> silhouette, keep", flush=True)
+                    flag[i] = False
     if args.min_target > 0:
         pres = ({i: (sum(pf[a:e]) / max(1, e - a) if flag.get(i) else 0.0) for i, (a, e) in enumerate(shots, 1)}
-                if args.presence == "person" else
+                if args.presence in ("person", "head") else
                 target_presence(args.video, shots, args.target_face, args.target_sex.upper()[:1], args.face_sim))
         for i, fr in pres.items():
             ok = fr >= args.min_target if args.presence == "face" else bool(flag.get(i))
@@ -329,7 +360,7 @@ def main() -> None:
             json.dumps({str(k): {"target_frac": round(v, 3),
                                  "generate": (v >= args.min_target) if args.presence == "face" else bool(flag.get(k)),
                                  "frames": list(shots[k - 1]),
-                                 "by": "person" if args.presence == "person" else
+                                 "by": args.presence if args.presence in ("person", "head") else
                                        (str(args.target_face) if args.target_face else f"sex={args.target_sex}")}
                         for k, v in pres.items()}, indent=1))
         if args.check_only:

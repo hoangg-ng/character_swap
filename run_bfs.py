@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-import character_swap as cs  # noqa: E402  (Comfy client)
+import comfy_client as cs  # noqa: E402
 
 LIGHT_MATCH = ("Match the lighting of the guide video: <Subject 1> is lit only by the same light sources as the guide "
                "video, with the same light direction, color temperature, exposure, contrast, shadows and highlights on "

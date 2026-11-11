@@ -21,12 +21,18 @@
 #   PRESENCE      face   = shot generated only where the target's face is seen (multi-person videos)  [face]
 #                 person = shot generated wherever anyone is visible (single-person videos: backs,
 #                          silhouettes, partial bodies too); scenery-only shots stay source
+#                 head   = like person, but segments showing only body parts (hem, sleeve: no head) also
+#                          stay source - the model would invent a whole person there
 #   TARGET_TEXT   how the prompt names the person to replace                                       [the woman]
 #   PROTECT       SAM 3.1 text of people to keep unchanged (latent lock), "" = none               [""]
 #   PROTECT_TEXT  how the prompt names them                                                         [""]
 #   FACE_ONLY=1   swap ONLY the face: SAM 3.1 tracks "face" -> edit mask (everything else locked), prompt keeps
 #                 hair/clothing/pose of the video, assembly composites the face region back onto the source
 #   FACE_GROW     px the face mask is grown (room for the jaw line / hairline)                         [12]
+#   TONE_PERSON   post-process: in shots where the generated person is >1.25x brighter than the original
+#                 (e.g. a dark, low-key shot), match her tone to the original person (tone_match.py)     [0.8]
+#   LIGHT_MATCH=1 add the lighting-match instruction (light only from the video's light sources, not from the
+#                 reference photo) - for dark / low-key shots where the swapped person looks too bright      [0]
 #   KEEP_OUTFIT=1 face-only character reference: swap face/head/hair, keep the clothing of the video     [0]
 #   SOLO_SHOTS    shots where the target is the only person (no "keep the others" prompt note)    [""]
 #   REALISM (0.8)  REF_COLOR (reinhard_lab:1.0)  RES (480|720)  SEED (42)  MIN_TARGET (0.1)
@@ -46,7 +52,7 @@ CUTS=${CUTS:-auto}; CHAR_DETAILS=${CHAR_DETAILS:?CHAR_DETAILS not set}
 TARGET_SEX=${TARGET_SEX:-F}; PRESENCE=${PRESENCE:-face}; TARGET_TEXT=${TARGET_TEXT:-the woman}
 PROTECT=${PROTECT:-}; PROTECT_TEXT=${PROTECT_TEXT:-}; SOLO_SHOTS=${SOLO_SHOTS:-}
 REALISM=${REALISM:-0.8}; REF_COLOR=${REF_COLOR-reinhard_lab:1.0}; RES=${RES:-480}; SEED=${SEED:-42}
-MIN_TARGET=${MIN_TARGET:-0.1}; KEEP_OUTFIT=${KEEP_OUTFIT:-0}; FACE_ONLY=${FACE_ONLY:-0}; FACE_GROW=${FACE_GROW:-12}; SPLICE=${SPLICE:-}; ONLY=${ONLY:-}
+MIN_TARGET=${MIN_TARGET:-0.1}; KEEP_OUTFIT=${KEEP_OUTFIT:-0}; LIGHT_MATCH=${LIGHT_MATCH:-0}; TONE_PERSON=${TONE_PERSON:-0.8}; FACE_ONLY=${FACE_ONLY:-0}; FACE_GROW=${FACE_GROW:-12}; SPLICE=${SPLICE:-}; ONLY=${ONLY:-}
 JOB=${JOB:-gen_seed$SEED}; OUT=${OUT:-final_seed$SEED}
 export CHAR_SWAP_OUT="$CASE/output"; W_DIR="$CHAR_SWAP_OUT/$JOB"; O_DIR="$CHAR_SWAP_OUT/$OUT"
 
@@ -66,6 +72,7 @@ if [ "${ASSEMBLE_ONLY:-0}" != 1 ]; then
   [ -n "$PROTECT" ] && ARGS+=(--protect "$PROTECT" --protect-only)
   [ "$KEEP_OUTFIT" = 1 ] && [ "$FACE_ONLY" != 1 ] && ARGS+=(--keep-outfit)
   [ -n "$EXTRA" ] && ARGS+=(--ref-extra "$EXTRA")
+  [ "$LIGHT_MATCH" = 1 ] && ARGS+=(--light-match)
   [ "$FACE_ONLY" = 1 ] && [ -z "$PROTECT" ] && ARGS+=(--face-only --subject "face" --mask-grow "$FACE_GROW")
   [ "${CHECK_ONLY:-0}" = 1 ] && ARGS+=(--check-only)
   $PY -u bfs_full.py "${ARGS[@]}" 2>&1 | grep -v -E "running\.\.\.|^\s*$"
@@ -77,7 +84,7 @@ CUTS_USED=$(cat "$W_DIR/cuts.txt")
 GEN=$($PY -c "import json;d=json.load(open('$W_DIR/target_check.json'));print(' '.join(k for k,v in d.items() if v['generate']))" 2>/dev/null || echo "")
 SHOTS=""
 for s in $GEN; do d="$W_DIR/shot$(printf %02d $s)"; ls "$d"/save_*.mp4 >/dev/null 2>&1 && SHOTS="$SHOTS --shot $s=$d" || echo "  shot $s: no result -> source"; done
-if [ "$FACE_ONLY" = 1 ]; then ASM=(--color-match --feather 4); else ASM=(--raw --letterbox); fi   # face: composite on source
+if [ "$FACE_ONLY" = 1 ]; then ASM=(--color-match --feather 4); else ASM=(--raw --letterbox --tone-person "$TONE_PERSON"); fi   # face: composite on source
 $PY -u assemble_bfs.py --video "$VIDEO" --cuts "$CUTS_USED" --out "$O_DIR" "${ASM[@]}" $SHOTS
 if [ -n "$SPLICE" ]; then
   for sp in $SPLICE; do n=${sp%%=*}; f=$(abspath "${sp#*=}"); cp "$f" "$O_DIR/s$n.mp4"; echo "  shot $n: spliced from $f"; done

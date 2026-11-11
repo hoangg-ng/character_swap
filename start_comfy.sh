@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the ComfyUI backend used by character_swap.py.
+# Launch a ComfyUI backend for the pipeline (run_swap.sh uses ports 8188-8190, one per GPU).
 # Usage: GPU=1,2 PORT=8188 bash start_comfy.sh   (nvidia-smi numbering)
 # Pick a 48 GB A6000 (the 20 GB A4500 is too small even with offloading).
 set -euo pipefail

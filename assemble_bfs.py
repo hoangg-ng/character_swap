@@ -61,6 +61,11 @@ def main() -> None:
                     help="re-apply the source's black letterbox bars (detected per shot) with a small margin; BFS "
                          "paints into the bars and leaves a dark line at the bar edge")
     ap.add_argument("--bar-margin", type=int, default=3)
+    ap.add_argument("--tone-person", type=float, default=0.0,
+                    help="strength (0-1) of matching the generated person's tone to the original person "
+                         "(tone_match.py), applied only to shots where the generated person is clearly brighter")
+    ap.add_argument("--tone-trigger", type=float, default=1.25,
+                    help="apply --tone-person when generated/original person lightness exceeds this ratio")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
@@ -117,6 +122,19 @@ def main() -> None:
                                          interpolation=cv2.INTER_LANCZOS4))
             how = "SAM-mask composite" if masks else ("man restored from source" if prot else "raw (no composite)")
             log[i] = f"{gen_p} | lead {lead} | {how}"
+            if args.tone_person > 0:
+                import tone_match as tm
+                srcs = [cv2.resize(srcin[min(k, len(srcin) - 1)], (OW, OH)) for k in range(lead, lead + n)]
+                lg, ls = [], []
+                for f, sf in list(zip(frames, srcs))[::6]:           # sample: person lightness, generated vs source
+                    bg_, bs_ = tm.person_box(f), tm.person_box(sf)
+                    if bg_ and bs_:
+                        lg.append(cv2.cvtColor(f[bg_[1]:bg_[3], bg_[0]:bg_[2]], cv2.COLOR_BGR2LAB)[..., 0].mean())
+                        ls.append(cv2.cvtColor(sf[bs_[1]:bs_[3], bs_[0]:bs_[2]], cv2.COLOR_BGR2LAB)[..., 0].mean())
+                ratio = float(np.mean(lg) / max(np.mean(ls), 1.0)) if lg else 1.0
+                if ratio > args.tone_trigger:
+                    frames = [tm.tone_frame(sf, f, args.tone_person) for f, sf in zip(frames, srcs)]
+                    log[i] += f" | person toned (generated {ratio:.2f}x brighter)"
         if args.letterbox and i in given:
             # rows that are black in every source frame of this shot = letterbox bars
             rm = np.stack([cv2.resize(f, (OW, OH)).mean(axis=(1, 2)) for f in src]).max(axis=0)
