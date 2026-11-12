@@ -53,6 +53,8 @@ done
 uv pip install ultralytics insightface "scenedetect>=0.7"
 uv pip uninstall onnxruntime onnxruntime-gpu 2>/dev/null || true
 uv pip install onnxruntime-gpu
+# redis: the web-app worker (python -m worker, contracts/); the worker needs Python >= 3.11
+uv pip install "redis>=5,<7"
 
 # ---------- 5. Model weights ----------
 if [ "${SKIP_MODELS:-0}" = "1" ]; then echo "SKIP_MODELS=1 -> done (no weights)."; exit 0; fi

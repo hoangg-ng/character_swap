@@ -8,6 +8,9 @@ which the final video is rebuilt.
 
 Characters live in characters/<name>/ (cutout.png, face.png|jpg, details.txt); new ones can be added from photos.
 Start: bash scripts/start_ui.sh
+
+The project logic lives in utils/swap_project.py and is shared with the web-app worker (worker/): this Gradio UI keeps
+working alongside the web-app, and both see the same projects (SWAP_CASES_DIR) and characters (SWAP_CHARS_DIR).
 """
 from __future__ import annotations
 
@@ -18,16 +21,15 @@ import shutil
 import signal
 import subprocess
 import time
-import urllib.request
 from pathlib import Path
 
-import cv2
 import gradio as gr
 
+from utils import swap_project as sp
+
 ROOT = Path(__file__).resolve().parent
-CASES = ROOT / "cases"
-CHARS = ROOT / "characters"
-COMFY = ["http://127.0.0.1:8188", "http://127.0.0.1:8189", "http://127.0.0.1:8190"]
+CASES = sp.CASES
+CHARS = sp.CHARS
 RUNS: dict[str, subprocess.Popen] = {}          # project -> running pipeline
 SEEN: dict[str, float] = {}                     # project -> final video mtime shown
 
@@ -53,19 +55,13 @@ body, .gradio-container { background: var(--bg) !important; color: var(--text); 
 .bar > div { height: 100%; background: var(--accent); transition: width .5s; }
 footer { display: none !important; }
 """
-STAGES = [("[sheet]", "Building the character sheet"), ("auto cuts", "Finding scene cuts"),
-          ("target check", "Checking which shots show the person"), ("generating on", "Generating shots"),
-          ("[assembled]", "Assembling the video"), ("[facerefine]", "Refining faces"), ("[done]", "Done")]
+STAGES = sp.STAGES
+IDENT, KEEP = sp.IDENT, sp.KEEP
 
 
 # ---------- projects ----------
-def _num(p: Path) -> int:
-    return int(re.sub(r"\D", "", p.name) or 0)
-
-
-def projects() -> list[tuple[str, str]]:
-    ds = sorted((p for p in CASES.glob("demo*") if (p / "case.env").exists()), key=_num, reverse=True)
-    return [(f"Demo {_num(p)}", p.name) for p in ds]
+_num = sp.num
+projects, next_project, meta = sp.projects, sp.next_project, sp.meta
 
 
 def first_project():
@@ -73,70 +69,28 @@ def first_project():
     return ps[0][1] if ps else None
 
 
-def next_project() -> str:
-    return f"demo{max((_num(p) for p in CASES.glob('demo*')), default=0) + 1}"
-
-
-def meta(proj: str) -> dict:
-    f = CASES / proj / "project.json"
-    return json.loads(f.read_text()) if proj and f.exists() else {}
-
-
 # ---------- characters ----------
-def characters() -> list[str]:
-    return sorted(p.name for p in CHARS.iterdir() if (p / "cutout.png").exists()) if CHARS.exists() else []
-
-
-def char_face(name: str) -> Path | None:
-    return next((p for p in (CHARS / name / "face.png", CHARS / name / "face.jpg") if p.exists()), None)
+characters, char_face = sp.characters, sp.char_face
 
 
 def char_gallery():
-    return [(str(char_face(n) or CHARS / n / "cutout.png"), n) for n in characters()]
+    return [(str(char_face(n) or sp.CHARS / n / "cutout.png"), n) for n in characters()]
 
 
 def add_character(name, photo, face_photo, details):
-    import numpy as np
-    from utils import tone_match as tm
-    from utils.face_refine import _face_app
-    name = re.sub(r"[^a-z0-9_]+", "_", (name or "").strip().lower()).strip("_")
-    if not (name and photo):
-        return "Give the character a name and a full-body photo.", gr.update()
-    img = cv2.imread(photo)
-    mask, box = tm.person_mask(img)
-    if mask is None:
-        return "No person found in that photo.", gr.update()
-    d = CHARS / name; d.mkdir(parents=True, exist_ok=True)
-    out = np.full_like(img, 255); out[mask] = img[mask]
-    x0, y0, x1, y1 = box; m = int(0.04 * max(img.shape[:2]))
-    cv2.imwrite(str(d / "cutout.png"), out[max(0, y0 - m):y1 + m, max(0, x0 - m):x1 + m])
-    src = cv2.imread(face_photo) if face_photo else img
-    fs = _face_app().get(src)
-    if fs:
-        f = max(fs, key=lambda x: x.bbox[2] - x.bbox[0]); x0, y0, x1, y1 = f.bbox.astype(int); w, h = x1 - x0, y1 - y0
-        cv2.imwrite(str(d / "face.png"), src[max(0, y0 - h // 2):y1 + h // 3, max(0, x0 - w // 2):x1 + w // 2])
-    (d / "details.txt").write_text((details or "Female").strip() + "\n")
-    return f"Added **{name}**.", gr.update(value=char_gallery())
+    try:
+        d = sp.process_character(name, photo, face_photo, details or "")
+    except ValueError as e:                    # NoPersonFound, or no name / photo
+        return str(e), gr.update()
+    return f"Added **{d.name}**.", gr.update(value=char_gallery())
 
 
 # ---------- running ----------
-def pipeline_env(proj: str, m: dict, only: str = "") -> dict:
-    inp = CASES / proj / "input"
-    env = dict(os.environ, CASE=f"cases/{proj}", JOB="gen", OUT="final", SHEET_PERSON=f"input/{m['char']}_cutout.png",
-               CHAR_DETAILS=m["details"], KEEP_OUTFIT="1" if m["keep"] else "0",
-               UPSCALE="1.5" if m["q"] == "720" else "0", RELIGHT="1" if m["relight"] else "0",
-               PROTECT=m.get("protect", ""), PROTECT_TEXT=m.get("protect", ""),
-               CHAR_REF="", CHAR_REF_EXTRA="", CHAR_REF_FACE="", ONLY=only)
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    face = next((f"input/{m['char']}_face{e}" for e in (".png", ".jpg") if (inp / f"{m['char']}_face{e}").exists()), "")
-    if face:
-        env["SHEET_FACE"] = face; env["FACE_REFINE_REF"] = face
-    return env
+pipeline_env = sp.pipeline_env
 
 
 def launch(proj: str, env: dict) -> None:
-    log = CASES / proj / "output" / "run.log"; log.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(log, "a"); fh.write(f"\n===== {time.strftime('%H:%M:%S')} ONLY={env.get('ONLY') or 'all'}\n"); fh.flush()
+    fh = sp.open_run_log(proj, env.get("ONLY") or "")
     RUNS[proj] = subprocess.Popen(["bash", "scripts/run_swap.sh"], cwd=ROOT, env=env, stdout=fh,
                                   stderr=subprocess.STDOUT, start_new_session=True)
 
@@ -146,29 +100,20 @@ def start_swap(video, who, sel, keep, quality, relight, protect):
         return "Upload a source video.", gr.update()
     if not sel:
         return "Pick a character.", gr.update()
-    proj = next_project(); d = CASES / proj
+    proj = next_project(); d = sp.CASES / proj
     (d / "input").mkdir(parents=True); (d / "output").mkdir()
     ext = Path(video).suffix or ".mp4"; shutil.copy2(video, d / "input" / f"video{ext}")
-    for f in (CHARS / sel).iterdir():
-        shutil.copy2(f, d / "input" / f"{sel}_{f.name}")
     who = (who or "the woman").strip().replace('"', "'")
-    (d / "case.env").write_text(f"# Swap character web UI project\nVIDEO=${{VIDEO:-input/video{ext}}}\nCUTS=${{CUTS:-auto}}\n"
-                                f"CROP=${{CROP-auto}}\nTARGET_TEXT=${{TARGET_TEXT:-\"{who}\"}}\nPRESENCE=${{PRESENCE:-head}}\n")
-    m = dict(char=sel, details=(CHARS / sel / "details.txt").read_text().strip(), keep=bool(keep),
+    m = dict(char=sel, details=(sp.CHARS / sel / "details.txt").read_text().strip(), keep=bool(keep),
              q="720" if quality.startswith("720") else "480", relight=bool(relight), protect=(protect or "").strip(),
              who=who, created=time.strftime("%Y-%m-%d %H:%M"))
     (d / "project.json").write_text(json.dumps(m, indent=1))
+    sp.prepare_case(proj)                      # character files -> input/, case.env
     launch(proj, pipeline_env(proj, m))
     return f"Started **Demo {_num(d)}**.", gr.update(choices=projects(), value=proj)
 
 
-IDENT = {"same": (None, None), "stronger": (0.10, 14), "strongest": (0.07, 10)}
-KEEP = ["unchanged", "the video's clothes", "her own clothes"]
-
-
-def shot_edits(proj: str) -> dict:
-    f = CASES / proj / "output" / "gen" / "shot_edits.json"
-    return json.loads(f.read_text()) if proj and f.exists() else {}
+shot_edits = sp.shot_edits
 
 
 def plan_edit(proj, shot, request):
@@ -178,27 +123,17 @@ def plan_edit(proj, shot, request):
         return ("Select a shot first.",) + nothing[1:]
     if not (request or "").strip():
         return ("Describe the change first.",) + nothing[1:]
-    tc = json.loads((CASES / proj / "output" / "gen" / "target_check.json").read_text())
-    if not tc.get(str(shot), {}).get("generate"):
+    if not sp.is_swapped(proj, shot):
         return (f"Shot {shot} is kept from the original video (nobody to swap), so it cannot be edited.",) + nothing[1:]
     from utils.edit_planner import plan
-    clip = CASES / proj / "output" / "gen" / "_ui_shots" / f"s{shot:02d}.mp4"
-    cap = cv2.VideoCapture(str(clip)); n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); frames = []
-    for j, k in enumerate((n // 6, n // 2, 5 * n // 6)):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, k); ok, f = cap.read()
-        if ok:
-            fp = clip.with_name(f"plan_{shot:02d}_{j}.jpg"); cv2.imwrite(str(fp), f); frames.append(str(fp))
-    m = meta(proj)
-    info = {"shot": shot, "status": "swapped", "character": m.get("details", ""),
-            "current_settings": shot_edits(proj).get(str(shot), {})}
+    frames, info = sp.plan_inputs(proj, shot)
     p = plan(request.strip(), frames, info)
     if not p.get("possible", True):
         return (f"**Not possible:** {p.get('explanation', '')}",) + nothing[1:]
-    keep = "unchanged" if p.get("keep_outfit") is None else (KEEP[1] if p["keep_outfit"] else KEEP[2])
-    rl = p.get("relight")
+    f = sp.plan_to_fields(p)
+    keep = {"unchanged": KEEP[0], "video": KEEP[1], "own": KEEP[2]}[f["clothes"]]
     return (f"**Plan:** {p.get('explanation', '')}  \nCheck the settings below, adjust if needed, then re-render.",
-            p.get("note", ""), p.get("identity", "same"), rl is not None, float(rl if rl is not None else 1.0), keep,
-            bool(p.get("new_take") or p.get("note")))
+            f["note"], f["identity"], f["change_light"], f["relight_strength"], keep, f["new_take"])
 
 
 def rerender_shot(proj, shot, note, identity, change_light, light, keep, new_take):
@@ -206,27 +141,9 @@ def rerender_shot(proj, shot, note, identity, change_light, light, keep, new_tak
         return "Select a shot first."
     if proj in RUNS and RUNS[proj].poll() is None:
         return "This project is still running."
-    job = CASES / proj / "output" / "gen"
-    tc = json.loads((job / "target_check.json").read_text())
-    if not tc.get(str(shot), {}).get("generate"):
+    if not sp.is_swapped(proj, shot):
         return f"Shot {shot} is kept from the original video (nobody to swap), so there is nothing to re-render."
-    edits = shot_edits(proj); e = edits.get(str(shot), {})
-    e = e if isinstance(e, dict) else {"note": str(e)}
-    if (note or "").strip():
-        e["note"] = note.strip()
-    sc, px = IDENT.get(identity or "same", (None, None))
-    if sc:
-        e["soft_face_scale"], e["soft_face_px"] = sc, px
-    if change_light:
-        e["relight"] = float(light)
-    if keep == KEEP[1]:
-        e["keep_outfit"] = True
-    elif keep == KEEP[2]:
-        e["keep_outfit"] = False
-    if new_take or not (note or "").strip():
-        e["take"] = int(e.get("take", 0)) + 1
-    edits[str(shot)] = e
-    (job / "shot_edits.json").write_text(json.dumps(edits, indent=1, ensure_ascii=False))
+    e = sp.apply_shot_edit(proj, shot, note, identity, change_light, light, keep, new_take)
     launch(proj, pipeline_env(proj, meta(proj), only=str(shot)))
     return f"Re-rendering shot {shot} with {json.dumps(e, ensure_ascii=False)}. The final video is rebuilt afterwards."
 
@@ -236,27 +153,12 @@ def stop(proj):
     if not p or p.poll() is not None:
         return "Nothing is running."
     os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-    for u in COMFY:                                   # remove this project's jobs from the GPU queues
-        try:
-            q = json.load(urllib.request.urlopen(u + "/queue", timeout=2))
-            mine = lambda it: f"/{proj}/" in json.dumps(it[2]) or f"{proj}_" in json.dumps(it[2])
-            pend = [it[1] for it in q["queue_pending"] if mine(it)]
-            if pend:
-                urllib.request.urlopen(urllib.request.Request(u + "/queue", data=json.dumps({"delete": pend}).encode(),
-                                                              headers={"Content-Type": "application/json"}))
-            if any(mine(it) for it in q["queue_running"]):
-                urllib.request.urlopen(urllib.request.Request(u + "/interrupt", data=b"{}",
-                                                              headers={"Content-Type": "application/json"}))
-        except Exception:
-            pass
+    sp.stop_comfy_jobs(proj)                   # remove this project's jobs from the GPU queues
     return "Stopped."
 
 
 # ---------- status & results ----------
-def last_run_log(proj: str) -> str:
-    log = CASES / proj / "output" / "run.log" if proj else None
-    t = log.read_text(errors="replace") if log and log.exists() else ""
-    return t[t.rfind("====="):] if "=====" in t else t
+last_run_log = sp.last_run_log
 
 
 def status_html(proj: str) -> str:
@@ -264,12 +166,11 @@ def status_html(proj: str) -> str:
         return "<div id='status'><span class='meta'>No project yet. Upload a video and press Swap character.</span></div>"
     txt = last_run_log(proj)
     running = proj in RUNS and RUNS[proj].poll() is None
-    stage, k = ("Starting" if running else "Ready"), 0
-    for i, (key, label) in enumerate(STAGES):
-        if key in txt:
-            stage, k = label, i + 1
+    label, k = sp.stage_of(txt)
+    stage = label or ("Starting" if running else "Ready")
     if stage == "Generating shots":
-        stage += f" ({len(re.findall(r'shot \d+: done', txt))}/{max(1, len(re.findall(r'generating on', txt)))})"
+        done, started = len(re.findall(r"shot \d+: done", txt)), len(re.findall(r"generating on", txt))
+        stage += f" ({done}/{max(1, started)})"
     if not running and txt and "[done]" not in txt:
         stage = "Stopped"
     pct = int(100 * k / len(STAGES))
@@ -282,36 +183,18 @@ def status_html(proj: str) -> str:
 
 def shots(proj: str):
     """([(thumbnail, caption)], [shot numbers]) cut from the final video at the pipeline's shot boundaries."""
-    job, final = CASES / proj / "output" / "gen", CASES / proj / "output" / "final" / "swapped.mp4"
-    if not (proj and final.exists() and (job / "cuts.txt").exists()):
-        return [], []
-    src = next((CASES / proj / "output").glob("_source_cropped*.mp4"), None) or next((CASES / proj / "input").glob("video.*"))
-    cap = cv2.VideoCapture(str(src)); fps = cap.get(cv2.CAP_PROP_FPS) or 24; n_src = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cuts = [0] + [int(c) for c in (job / "cuts.txt").read_text().strip().split(",") if c] + [n_src]
-    tc = json.loads((job / "target_check.json").read_text()) if (job / "target_check.json").exists() else {}
-    sd = job / "_ui_shots"; sd.mkdir(exist_ok=True)
-    stamp = final.stat().st_mtime
     items, nums = [], []
-    for i in range(len(cuts) - 1):
-        a, b = cuts[i] / fps, cuts[i + 1] / fps
-        thumb, clip = sd / f"s{i + 1:02d}.jpg", sd / f"s{i + 1:02d}.mp4"
-        if not clip.exists() or clip.stat().st_mtime < stamp:
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(final),
-                            "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", "-an", str(clip)])
-            c2 = cv2.VideoCapture(str(clip)); c2.set(cv2.CAP_PROP_POS_FRAMES, c2.get(cv2.CAP_PROP_FRAME_COUNT) // 2)
-            ok, f = c2.read()
-            if ok:
-                cv2.imwrite(str(thumb), cv2.resize(f, (320, int(320 * f.shape[0] / f.shape[1]))))
-        if not thumb.exists():
+    for s in (sp.cut_shots(proj) if proj else []):
+        if s["thumb"] is None:
             continue
-        gen = tc.get(str(i + 1), {}).get("generate")
-        items.append((str(thumb), f"Shot {i + 1} · {a:.1f}–{b:.1f}s · {'swapped' if gen else 'original'}"))
-        nums.append(i + 1)
+        items.append((str(s["thumb"]), f"Shot {s['n']} · {s['start']:.1f}–{s['end']:.1f}s · "
+                                       f"{'swapped' if s['swapped'] else 'original'}"))
+        nums.append(s["n"])
     return items, nums
 
 
 def refresh(proj):
-    final = CASES / proj / "output" / "final" / "swapped.mp4" if proj else None
+    final = sp.CASES / proj / "output" / "final" / "swapped.mp4" if proj else None
     if final and final.exists():
         SEEN[proj] = final.stat().st_mtime
     items, nums = shots(proj) if proj else ([], [])
@@ -319,9 +202,8 @@ def refresh(proj):
 
 
 def tick(proj):
-    t = re.sub(r"\s*running\.\.\.\s+\d+s", "", last_run_log(proj).replace("\r", "\n")) if proj else ""
-    log = "\n".join([l for l in t.splitlines() if l.strip()][-40:])
-    final = CASES / proj / "output" / "final" / "swapped.mp4" if proj else None
+    log = "\n".join(sp.clean_log_lines(last_run_log(proj))) if proj else ""
+    final = sp.CASES / proj / "output" / "final" / "swapped.mp4" if proj else None
     if final and final.exists() and final.stat().st_mtime > SEEN.get(proj, 0) and not (proj in RUNS and RUNS[proj].poll() is None):
         s, f, items, nums = refresh(proj)                  # a run just finished: show the new final and shots
         return s, log, f, items, nums
@@ -332,7 +214,7 @@ def pick_shot(evt: gr.SelectData, proj, nums):
     i = nums[evt.index] if nums and evt.index < len(nums) else None
     if not i:
         return None, None, ""
-    clip = CASES / proj / "output" / "gen" / "_ui_shots" / f"s{i:02d}.mp4"
+    clip = sp.CASES / proj / "output" / "gen" / "_ui_shots" / f"s{i:02d}.mp4"
     e = shot_edits(proj).get(str(i), {})
     note = e.get("note", "") if isinstance(e, dict) else str(e)
     return (str(clip) if clip.exists() else None), i, note

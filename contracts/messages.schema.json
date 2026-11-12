@@ -1,0 +1,666 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GoldenAI-Video/contracts/messages.schema.json",
+  "title": "GoldenAI Video broker messages",
+  "description": "Payloads carried on the Redis streams listed in python/streams.py. Every message is stored as a single stream field `data` holding this JSON, alongside the flat index fields `job_id`, `kind` and `contract_version`.",
+  "$defs": {
+    "contract_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Version of this schema the writer was built against."
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "UUID4 assigned by the producer; the correlation id for every event about this job."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 / ISO 8601 in UTC, e.g. 2026-10-29T06:12:03.481Z."
+    },
+    "stage": {
+      "enum": [
+        "queued",
+        "resolving",
+        "submitted",
+        "rendering",
+        "downloading",
+        "finalizing"
+      ],
+      "description": "Coarse phase of the pipeline. Monotonic: a job never moves backwards."
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "description": "Terminal states are completed, failed and cancelled."
+    },
+    "error_code": {
+      "enum": [
+        "shot_not_found",
+        "invalid_shot",
+        "provider_rejected",
+        "provider_timeout",
+        "provider_unavailable",
+        "quota_exceeded",
+        "content_rejected",
+        "download_failed",
+        "internal_error",
+        "cancelled"
+      ]
+    },
+    "JobRequest": {
+      "type": "object",
+      "description": "web-app -> a worker pool, on the job stream of its `task`: video.jobs.generate (Research), video.jobs.character_swap or video.jobs.character_swap_util (character_swap). Carries the shot's identity, not its prompt: the worker resolves the shot itself, so a job stays valid if the shot is edited before it is picked up.",
+      "required": [
+        "contract_version",
+        "kind",
+        "job_id",
+        "project_id",
+        "shot_id",
+        "requested_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "$ref": "#/$defs/contract_version"
+        },
+        "kind": {
+          "const": "job.generate"
+        },
+        "job_id": {
+          "$ref": "#/$defs/job_id"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "description": "Project folder under resources/, or \"main\" for the root project."
+        },
+        "shot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "description": "Shot file stem, e.g. \"shot1\" for resources/<project>/contents/shot1.json."
+        },
+        "requested_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "requested_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256,
+          "description": "Opaque actor id for audit. Null when the app has no auth yet."
+        },
+        "idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "description": "If set, a worker that has already completed this key must re-publish the previous result instead of generating again."
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9,
+          "default": 5,
+          "description": "Advisory only; the Redis stream itself is FIFO."
+        },
+        "task": {
+          "enum": [
+            "generate",
+            "character_swap",
+            "character_swap_util"
+          ],
+          "default": "generate",
+          "description": "Which worker pool the job is for; decides the job stream (python/streams.py TASK_STREAMS). Omitted for generate jobs. For character_swap, shot_id is \"all\" (the whole video) or a shot number; for character_swap_util, overrides.action names the work."
+        },
+        "overrides": {
+          "type": "object",
+          "description": "Shallow overrides applied on top of the shot file's `generation` block. Anything omitted comes from the shot. Deliberately open: a provider may accept parameters this schema has never heard of, and it advertises them through ProviderCapabilities rather than through a schema change. The named properties below are only the ones whose types are fixed across every provider.",
+          "additionalProperties": true,
+          "properties": {
+            "model": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "duration_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            },
+            "resolution": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "prompt": {
+              "type": "string",
+              "maxLength": 20000
+            },
+            "prompt_optimizer": {
+              "type": "boolean"
+            },
+            "seed": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "ProgressEvent": {
+      "type": "object",
+      "description": "Research -> web-app, on stream video.events.progress. Advisory: dropping one never changes the outcome, it only makes the UI jumpier.",
+      "required": [
+        "contract_version",
+        "kind",
+        "job_id",
+        "stage",
+        "percent",
+        "emitted_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "$ref": "#/$defs/contract_version"
+        },
+        "kind": {
+          "const": "event.progress"
+        },
+        "job_id": {
+          "$ref": "#/$defs/job_id"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shot_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500,
+          "description": "Short human-readable note for the UI. Never contains secrets."
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "emitted_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "CompletedEvent": {
+      "type": "object",
+      "description": "Research -> web-app, on stream video.events.completed. Terminal and authoritative: the app may treat it as the job's final state even if progress events were lost.",
+      "required": [
+        "contract_version",
+        "kind",
+        "job_id",
+        "output",
+        "emitted_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "$ref": "#/$defs/contract_version"
+        },
+        "kind": {
+          "const": "event.completed"
+        },
+        "job_id": {
+          "$ref": "#/$defs/job_id"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shot_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "type": "object",
+          "required": [
+            "filename"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "filename": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 2048,
+              "description": "Fetchable URL, when the provider or a bucket exposes one. May expire."
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 1024,
+              "description": "Path relative to the Research pipeline's output dir, when the file was downloaded locally."
+            },
+            "bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "duration_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "resolution": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 32
+            }
+          },
+          "description": "Where the finished clip is. Open for the same reason as `overrides`: a provider may return extra artifacts, and a reader that does not recognise a field passes it through rather than dropping it."
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 128
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 256,
+              "description": "Provider-side task id, for chasing a render in their dashboard."
+            }
+          }
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "finished_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "emitted_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "FailedEvent": {
+      "type": "object",
+      "description": "Research -> web-app, on stream video.events.failed. Terminal. Published only after the worker has exhausted its retries, so `retryable` describes the class of fault, not a pending attempt.",
+      "required": [
+        "contract_version",
+        "kind",
+        "job_id",
+        "error",
+        "emitted_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "$ref": "#/$defs/contract_version"
+        },
+        "kind": {
+          "const": "event.failed"
+        },
+        "job_id": {
+          "$ref": "#/$defs/job_id"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shot_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/error_code"
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 2000,
+              "description": "Safe to show a user. Must not contain API keys or full provider responses."
+            },
+            "retryable": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "emitted_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "JobStatus": {
+      "type": "object",
+      "description": "Not a stream message: the shape of the Redis hash video.job:<job_id>, which is part of the contract. The producer creates it on enqueue; the worker advances it. It is the snapshot a late reader (a browser that connects mid-render) gets from GET /api/jobs/<job_id> before tailing events.",
+      "required": [
+        "job_id",
+        "status",
+        "project_id",
+        "shot_id",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "job_id": {
+          "$ref": "#/$defs/job_id"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "shot_id": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string",
+          "default": "generate",
+          "description": "The job's task. Absent in hashes written by a 1.1 producer, which means generate."
+        },
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "output": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Provider and model that produced the output, copied from the completed event. Lets the UI report what actually ran rather than what the shot file asked for."
+        },
+        "error": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "requested_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_event_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Redis stream id of the newest event folded into this snapshot; hand it back as Last-Event-ID to resume a tail with no gap and no duplicate."
+        }
+      }
+    },
+    "ParameterSpec": {
+      "type": "object",
+      "description": "One generation parameter a client may override, described well enough that a UI can render a control for it and a server can validate a value without knowing the parameter exists ahead of time.",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "type": {
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "enum"
+          ],
+          "default": "string",
+          "description": "A reader that does not recognise the value treats it as a string."
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "help": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        },
+        "minimum": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "maximum": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_length": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Allowed values, for type 'enum'."
+        },
+        "multiline": {
+          "type": "boolean",
+          "default": false
+        },
+        "group": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64,
+          "description": "Which form the control belongs in when one provider serves several, e.g. character_swap's \"create\" options and \"shot\" edits. Absent means the provider's only form."
+        },
+        "default": {
+          "description": "Suggested starting value; null means take it from the shot file."
+        }
+      }
+    },
+    "ModelSpec": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "default": {
+          "type": "boolean",
+          "default": false
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ParameterSpec"
+          },
+          "description": "Specs that apply only to this model, merged over the provider-level list by name so a model can narrow a shared parameter without restating the rest."
+        }
+      }
+    },
+    "ProviderCapabilities": {
+      "type": "object",
+      "description": "Published by Research workers to the Redis key <prefix>.capabilities:<provider> with a TTL, refreshed on a heartbeat. The web app reads these to build its form and validate overrides, which is what lets a model or parameter be added in Research with no change in the web app. Advisory: with none published, the web app passes overrides through with generic checks rather than blocking.",
+      "required": [
+        "provider"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "task": {
+          "type": "string",
+          "default": "generate",
+          "description": "The job task this provider serves. Overrides are validated only against providers of the job's task."
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelSpec"
+          }
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ParameterSpec"
+          },
+          "description": "Accepted regardless of model."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "contract_version": {
+          "$ref": "#/$defs/contract_version"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/JobRequest"
+    },
+    {
+      "$ref": "#/$defs/ProgressEvent"
+    },
+    {
+      "$ref": "#/$defs/CompletedEvent"
+    },
+    {
+      "$ref": "#/$defs/FailedEvent"
+    }
+  ]
+}

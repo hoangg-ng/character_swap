@@ -1,5 +1,7 @@
 # environment and upstream checkouts
 .venv/
+.venv-*/
+.pytest_cache/
 ComfyUI/
 __pycache__/
 *.pyc
@@ -28,3 +30,6 @@ legacy/workflows/
 .ui_password
 cases/*/output/_ui_logs/
 characters/
+
+# web-app worker settings (copy of worker/.env.example)
+worker/.env

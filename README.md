@@ -20,10 +20,15 @@ Everything below is the default of `scripts/run_swap.sh`; a case only needs its 
  2. target check         which shots/segments contain the person to replace (PRESENCE=face|head)
  3. references per shot  recoloured to the scene's light (scene only, people masked out);
                          face refs only where a face is visible, back view first where none is
- 4. generation 480p      MiniMax H3 + DMD turbo + BFS v1.1 (+ SAM lock on PROTECT people)
- 5. upscale to 720p      H3 latent upscaler x1.5 + refine pass with the Realism People LoRA 0.8
- 6. assembly             raw generated frames, letterbox, tone match for dark shots, crop bars padded back
- 7. FaceRefine + guard   face re-render, any frame whose identity drops is reverted; always last
+ 4. soft-face guide      SOFT_FACE=1: the original person's face is softened in the guide video (pose and coarse
+                         expression kept, identity detail gone), so the model cannot copy the original face
+ 5. generation 480p      MiniMax H3 + DMD turbo + BFS v1.1 (+ SAM lock on PROTECT people)
+ 6. upscale to 720p      H3 latent upscaler x1.5 + refine pass with the Realism People LoRA 0.8
+ 7. identity check       shots whose face looks more like the original person than the character are reported;
+                         AUTO_RETRY=N re-renders them with the next seeds and keeps the best attempt (off by default)
+ 8. assembly             raw generated frames, letterbox, tone match for dark shots (or RELIGHT=0-1: the source's
+                         broad light re-applied to the generated shots), crop bars padded back
+ 9. FaceRefine + guard   face re-render, any frame whose identity drops is reverted; always last
 ```
 ```bash
 CASE=cases/<name> bash scripts/run_swap.sh                 # standard: 720p, ~45-60 min for a 20 s clip on 3 GPUs
@@ -183,6 +188,9 @@ close-up +14 vs +31. Not implemented: an automatic redness check after generatio
 | `FACE_ONLY=1` | swap only the face: SAM tracks "face" as the edit mask, the prompt keeps hair/clothing/pose, and assembly composites the face region onto the source |
 | `TONE_PERSON` (0.8) | assembly post-process (`utils/tone_match.py`): where the generated person is > 1.25x brighter than the original, her LAB tone is matched to the original person inside her box, feathered. Normally lit shots are left alone so the new identity keeps its colours |
 | `LIGHT_MATCH=1` | adds a lighting-match sentence to the prompt (off by default; did not help in tests) |
+| `SOFT_FACE` (1) / `SOFT_FACE_SCALE` (0.15) | soften the original person's face in the guide video (identity removed, pose and coarse expression kept), so the model cannot copy the original face in close-ups. Per shot, `shot_edits.json` can set a stronger `soft_face_scale` / `soft_face_px` (web UI "Identity strength") |
+| `AUTO_RETRY` (0) | after generation `utils/identity_check.py` always checks every shot and warns when its face matches the original person more than the character; `AUTO_RETRY=N` re-renders those shots with the next N seeds and keeps the best attempt |
+| `RELIGHT` (0) | 0-1: re-light generated shots with the source's broad light (`utils/relight.py`) instead of `TONE_PERSON`; silhouettes are then generated too. Per shot via `shot_edits.json` (`relight`) |
 | `UPSCALE` (1.5) / `REALISM_STAGE` (2) | two-stage generation (step 6b): `UPSCALE=1.5` gives 720p from 480p (standard), `0` = 480p only for quick tests; 2.25 gives 1080p but takes ~3x the time of the 480p generation. `REALISM_STAGE=1/2/both` puts the Realism LoRA in stage 1, stage 2 or both; 2 tested best (identity 0.366 vs 0.350, sharper faces) |
 | `FACE_REFINE` (1) / `FACE_REFINE_REF` | step 9, FaceRefine + identity guard (default on; `0` = off). Identity from `FACE_REFINE_REF` (default the last `CHAR_REF_FACE` entry); shots that were not generated are skipped. `face_refine.py --guard-margin` (0.08, < 0 = guard off) and `--min-shot` (24) tune the guard. `FACE_REFINE=before` (with `UPSCALE`) refines the 480p shots before the upscale instead; it tested no better |
 | `CROP` | `auto` or `w:h:x:y`: crop constant black bars (pillarbox / letterbox) off the video for generation, pad the result back afterwards |
@@ -248,21 +256,61 @@ the library (`characters/<name>/`: cut-out, face photo, description; new ones ar
 **Swap character**. Each run is a new project, Demo 1, Demo 2, ... (`cases/demoN`, outputs in `output/gen` and
 `output/final`). The result is the final video plus its list of shots; select a swapped shot, type an instruction
 ("softer smile, she looks down") and **Re-render shot**: only that shot is generated again (the instruction is
-appended to its prompt via `output/gen/shot_notes.json`), then the final video is rebuilt.
+appended to its prompt via `output/gen/shot_edits.json`, which also holds the shot's identity strength, light,
+clothes and take), then the final video is rebuilt. **Plan edit** turns a free-form request in any language into those
+settings (`utils/edit_planner.py`, Qwen3-VL on GPU 0).
 Options: keep the video's clothes, 480p test / 720p final, re-light, people to keep unchanged.
+The project logic is in `utils/swap_project.py`, shared with the web-app worker (3c): both UIs see the same
+projects and characters.
 ```bash
 bash scripts/start_ui.sh            # http://127.0.0.1:7860, login swap / password in .ui_password
 ssh -N -J <user>@ilab2.cs.rutgers.edu -L 7860:127.0.0.1:7860 <user>@lerna.cs.rutgers.edu   # from a laptop abroad
 ```
 Run it inside `tmux` to keep it alive after logging out. `UI_HOST=0.0.0.0` exposes it on the network instead.
 
+## 3c. Web-app worker (GoldenAI web-app, "Character swap")
+The GoldenAI web-app (Flask + React, separate repo) offers the same workflow as `webui.py`. It does not run the
+pipeline itself: it enqueues jobs on Redis streams and this repo's worker runs them (`python -m worker`). The message
+format is `contracts/` (1.2.0), vendored byte-identical in the web-app and Research repos: never edit it here alone;
+change it in one repo, `python contracts/python/checksum.py --write`, then `scripts/sync-contracts.sh <other repo>`.
+
+| role | stream / group | does | GPU |
+|---|---|---|---|
+| `render` | `jobs.character_swap` / `swap-workers` | a whole video (`shot_id` "all") or one shot ("3" = `ONLY=3`, with the edit merged into `shot_edits.json`) through `scripts/run_swap.sh`; progress from the log, Stop kills it and clears the ComfyUI queues; then `manifest.json` (final video, shots, clips, thumbnails) | the ComfyUI servers (1-3) |
+| `util` | `jobs.character_swap_util` / `swap-util-workers` | `plan_edit` (edit planner) and `add_character` (cut-out + face crop of an uploaded photo), so they answer while a render runs | `PLANNER_GPU` (0) |
+
+Run **exactly one render worker per cluster** (one job drives all three ComfyUI servers); the render role claims a
+job from a dead worker only after 4 h (`WORKER_CLAIM_IDLE_MS`), longer than any render.
+
+**Shared folders.** The web-app and the worker must see the same `SWAP_CASES_DIR` (projects `demoN/`) and
+`SWAP_CHARS_DIR` (character library); by default the worker uses `cases/` and `characters/` of this repo, the
+Gradio UI's folders. The web-app writes `project.json` and `input/video.*` (and a new character's photos in
+`<name>/_upload/`); the worker writes everything else (`case.env`, `output/`, `manifest.json`).
+
+**Settings** (`worker/.env`, see `worker/.env.example`, or the environment): `REDIS_URL` and `STREAM_PREFIX` (must
+match the web-app's), `SWAP_CASES_DIR`, `SWAP_CHARS_DIR`, `PLANNER_GPU`, optional `WORKER_NAME`,
+`WORKER_CLAIM_IDLE_MS`, `SWAP_RUN_CMD`. The worker needs Python >= 3.11 and `redis` (installed by `setup.sh`).
+
+**Start order on the cluster** (one `tmux` window each):
+```bash
+redis-server --bind 127.0.0.1 --requirepass <password> --appendonly yes     # Redis 7 (e.g. from conda)
+GPU=1 PORT=8188 bash scripts/start_comfy.sh                                  # x3, as in section 2
+bash scripts/start_workers.sh                                                # render + util (ROLE=render|util for one)
+# then the web-app (its README): SWAP_CASES_DIR / SWAP_CHARS_DIR / REDIS_URL set to the same values
+```
+Tests (no GPU, fake pipeline `tests/fake_run_swap.sh`, fake Redis):
+`python -m venv .venv-test && .venv-test/bin/pip install pytest fakeredis redis jsonschema numpy opencv-python-headless && .venv-test/bin/python -m pytest tests`
+
 ## 4. Files
 ```
 char_swap/
 ├── run_bfs.py, bfs_full.py, assemble_bfs.py   main pipeline (one shot / all shots / assembly)
 ├── webui.py   web UI (scripts/start_ui.sh)
-├── scripts/   run_swap.sh (entry point), setup.sh, download_models.sh, start_comfy.sh
-├── utils/     comfy_client, tone_match, scene_color, make_char_sheet, make_outfit_ref, sheet_refs, face_refine, ...
+├── worker/    web-app worker (python -m worker --role render|util, scripts/start_workers.sh)
+├── contracts/ message format shared with the web-app (vendored, do not edit here alone)
+├── scripts/   run_swap.sh (entry point), setup.sh, download_models.sh, start_comfy.sh, start_workers.sh
+├── utils/     swap_project, comfy_client, tone_match, scene_color, make_char_sheet, make_outfit_ref, sheet_refs, ...
+├── tests/     worker + swap_project tests (pytest, no GPU)
 ├── cases/     <name>/input, case.env, output
 └── log.md     per-case results and findings
 ```
@@ -280,6 +328,8 @@ char_swap/
 | `utils/scene_color.py` | reference recolouring from the scene without people (`REF_COLOR_MODE` scene / scene_lum / skin) |
 | `utils/make_outfit_ref.py` | outfit crop from the video (largest complete frontal frame, cut out, head removed) for `KEEP_OUTFIT=1` sheets |
 | `utils/sheet_refs.py` | sorts a sheet's panels into main / extra / back / face references by content |
+| `utils/swap_project.py` | character-swap projects (`cases/demoN`) shared by `webui.py` and the worker: case preparation, pipeline environment, shot edits, progress from the log, manifest (shot clips + thumbnails), character cut-out |
+| `worker/` | web-app worker: `loop.py` (Redis consumer), `render.py` (run_swap.sh jobs), `util.py` (plan_edit, add_character), `capabilities.py` (the options the web-app shows) |
 | `utils/face_refine.py` | FaceRefine + identity guard, the last step (needs `Carasibana/ComfyUI-H3-FaceRefine`); `--shots-job` refines a job's generated shots, `--guard-only` re-applies the guard to refined shots |
 
 ## Licences

@@ -1,0 +1,15 @@
+# sha256 of every file in contracts/ except this one. Regenerate with:
+#   python contracts/python/checksum.py --write
+# contract: 1.2.0
+# combined: f2e0fffb7013f2744e40eb47ba63ea7825d3762ea8be33a573fcfc806627bf87
+9560b278123ef9a77e4052ca22faa779be33feb344e897b3e207b679cc23d2e4  README.md
+1e5b51cde515396a9fa762909cf8ca6584ccc564b325d2eebeea76175fe95c4d  VERSION
+18434b905947fa8b1be3921f1b073f8fbc5a836f0ba94dca19bc800d9b46b77a  messages.schema.json
+54c63a6edd742398bd6bcf78a36980a3dccb63e614c755f96fe41493b3396dcd  python/__init__.py
+2db5062d620b61adc3d5eb527b5d0026ce704173b06fb3645b88ebd27ee67207  python/capabilities.py
+69d6ddc4f59c4d48a4980808a0b842008c0a321011d35f5b209fa0839ad8e2a2  python/checksum.py
+68accb9fffb60e3f7584952970ed27697ac4d313edff00b392a2d241f3bd2379  python/client.py
+fceb8d071bc415ce1eb5a054c3576ad0bef49108bf3a44e0ef230c2cdea5efea  python/messages.py
+076d40658ad03b8a6631d5601566406327fb6004b5b6bb9067f4752676e66c1a  python/streams.py
+b1a212fbde3ad707fcfa9ac503b9350ff91a3fb296ee13a02630aff26abfd394  typescript/capabilities.ts
+daf676b62469b55f18dfdf42721d2e9e59e9c5d7c9fbbc29a932b405edce63a1  typescript/messages.ts
