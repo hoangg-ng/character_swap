@@ -111,6 +111,46 @@ def build(video: str, ref: str, prompt: str, w: int, h: int, n: int, seed: int, 
     }
 
 
+UPSCALER = "minimax_h3_latent_upscaler_2d_conv_v1_fp16.safetensors"
+STAGE2_SIGMAS = "0.9035, 0.6316, 0.3158, 0.0000"      # refine pass after the latent upscale (as in the upscaler's
+                                                      # own R2V example workflow)
+
+
+def add_upscale(wf: dict, scale: float, w: int, h: int, n: int, stage2_model: list, sharpness: int = 1,
+                chunk_frames: int = 73) -> tuple:
+    """Two-stage generation: stage 1 as built (w x h), then the video latent is upscaled by the learned H3 latent
+    upscaler (LBH-123-AI, 2D v1), re-joined with the audio latent and refined at the high resolution with a short
+    3-step pass, conditioned on the same references and guide video re-encoded at the new size."""
+    w2, h2 = int(round(w * scale / 32)) * 32, int(round(h * scale / 32)) * 32
+    wf["s1_sep"] = {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["sample", 0]}}
+    wf["up"] = {"class_type": "MinimaxH3LatentUpscalerNode2D",
+                "inputs": {"latent": ["s1_sep", 0], "model_name": UPSCALER, "mode": "scale by multiplier",
+                           "mode.scale": float(scale), "sharpness": sharpness, "align": 32,
+                           "temporal_chunking": "single pass", "force_unload": True, "device": "cuda",
+                           "precision": "fp16"}}
+    wf["s2_cat"] = {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": ["up", 0], "audio_latent": ["s1_sep", 1]}}
+    r2 = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": dict(wf["r2v"]["inputs"])}
+    r2["inputs"].update({"width": w2, "height": h2})
+    wf["r2v2"] = r2
+    wf["empty2"] = {"class_type": "EmptyMiniMaxH3LatentAV", "inputs": {"width": w2, "height": h2, "length": n}}
+    g2 = {"class_type": "MiniMaxH3AddGuide", "inputs": dict(wf["guide"]["inputs"])}
+    g2["inputs"].update({"positive": ["r2v2", 0], "latent": ["empty2", 0]})
+    wf["guide2"] = g2
+    wf["sigmas2"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": STAGE2_SIGMAS}}
+    # refine in overlapping time chunks (MMH3SplitUpscale: H3-grid chunks, cross-fade, motion/identity anchors,
+    # per-chunk guide keyframes) so long shots fit in GPU memory at high resolution
+    wf["split2"] = {"class_type": "MMH3TemporalSplitParamsV10",
+                    "inputs": {"chunk_frames": chunk_frames, "temporal_overlap_frames": 22, "anchor_strength": 0.999,
+                               "motion_anchor_frames": "22", "identity_anchor_frames": 24}}
+    wf["sample2"] = {"class_type": "MMH3SplitUpscale",
+                     "inputs": {"model": stage2_model, "conditioning": ["guide2", 0], "negative": ["guide2", 0],
+                                "latent": ["s2_cat", 0], "noise": ["noise", 0], "sampler": ["sampler", 0],
+                                "sigmas": ["sigmas2", 0], "cfg": 1.0, "temporal_split_param": ["split2", 0],
+                                "seam_polish": "off", "color_match": True}}
+    wf["sep"]["inputs"]["av_latent"] = ["sample2", 0]           # decode the refined, upscaled result
+    return w2, h2
+
+
 def add_sam_mask(wf: dict, subject: str, threshold: float, grow: int, prefix: str,
                  protect: str = "", protect_threshold: float = 0.7) -> dict:
     """Confine generation to the target person: SAM 3.1 tracks `subject` in every frame of the guide; the
@@ -202,6 +242,14 @@ def main() -> None:
                     help="METHOD:STRENGTH, e.g. reinhard_lab:0.6 - recolour the character reference to this shot's "
                          "colour theme with ComfyUI's ColorTransfer node (ref = the shot's frames) before it is "
                          "used as <Picture 1>; the recoloured reference is saved as refcolor_*.png")
+    ap.add_argument("--ref-color-scene", action="store_true",
+                    help="with --ref-color reinhard_lab: take the colour statistics from the scene only (all people "
+                         "masked out with YOLO11-seg, utils/scene_color.py) instead of the whole frames, so the "
+                         "replaced person's clothes do not tint the character")
+    ap.add_argument("--ref-color-mode", default="scene", choices=["scene", "scene_lum", "skin"],
+                    help="with --ref-color-scene: scene = scene without people; scene_lum = the same, but colour "
+                         "(a/b) only at 30%% so the skin hue stays the character's; skin = light on the people's "
+                         "face skin, mapped from the character's face skin")
     ap.add_argument("--realism", type=float, default=0.0,
                     help="strength of fal/MiniMax-H3-Realism-People-LoRA stacked after BFS (0 = off; 0.6-1.0); "
                          "also prefixes the prompt with its trigger word r34l1sm")
@@ -211,6 +259,16 @@ def main() -> None:
                     help="swap only the face (use with --subject face): hair, clothing, body follow the guide")
     ap.add_argument("--keep-outfit", action="store_true",
                     help="face-only reference: swap face/head/hair, keep the guide subject's clothing")
+    ap.add_argument("--upscale", type=float, default=0.0,
+                    help="two-stage: upscale the stage-1 latent by this factor with the H3 latent upscaler and refine "
+                         "at the higher resolution (0 = off, e.g. 1.5)")
+    ap.add_argument("--from-gen", type=Path, default=None,
+                    help="with --upscale: skip stage 1 and upscale/refine this existing generated clip of the shot "
+                         "(re-encoded with the video VAE)")
+    ap.add_argument("--chunk-frames", type=int, default=73,
+                    help="with --upscale: stage-2 refine chunk length in frames (H3 grid 5+17n; overlap 22)")
+    ap.add_argument("--realism-stage", default="both", choices=["1", "2", "both"],
+                    help="with --upscale: apply the Realism LoRA in stage 1, stage 2 or both")
     ap.add_argument("--comfy-url", default="http://127.0.0.1:8188")
     ap.add_argument("--job", required=True)
     args = ap.parse_args()
@@ -269,7 +327,38 @@ def main() -> None:
         wf["guide"]["inputs"]["image"] = ["gparts", 0]         # the model follows the cleaned guide
         # source latent, SAM target mask and output audio keep using the original video ("parts")
     import json
-    if args.ref_color:
+    scene_st = None
+    if args.ref_color and args.ref_color_scene:
+        from utils import scene_color as scol
+        mode = args.ref_color_mode
+        src_st, abf = None, (0.3 if mode == "scene_lum" else 1.0)
+        scene_st = scol.skin_stats(args.video) if mode == "skin" else None
+        if mode == "skin" and scene_st is not None:
+            import cv2 as _cv2                      # source = the character's face skin (largest face in her refs)
+            import numpy as np
+            cands = [inp / rname] + [Path(x) for x in args.ref_extra.split(",") if x]
+            best = None
+            for cp in cands:
+                pxs = scol.face_pixels(_cv2.imread(str(cp)))
+                if pxs is not None and (best is None or len(pxs) > len(best)):
+                    best = pxs
+            src_st = (best.mean(0), np.maximum(best.std(0), 1e-3)) if best is not None else None
+            if src_st is None:
+                scene_st = None
+        if scene_st is None:
+            mode = "scene" if mode == "skin" else mode
+            scene_st = scol.scene_stats(args.video)
+        print(f"reference colour mode {mode} ({scene_st[2]:.0%} of sampled pixels used)", flush=True)
+
+        def scene_recolor(src_path: Path, name: str) -> str:
+            _, st_ = (args.ref_color.split(":") + ["0.6"])[:2]
+            o = scol.recolor(src_path, scene_st, float(st_), out / f"refscene_{name}.png", ab_factor=abf,
+                             src_stats=src_st)
+            shutil.copy2(o, inp / f"bfs_{safe}_scene_{name}.png")
+            return f"bfs_{safe}_scene_{name}.png"
+
+        wf["ref"]["inputs"]["image"] = scene_recolor(inp / rname, "ref")
+    if args.ref_color and scene_st is None:
         method, strength = (args.ref_color.split(":") + ["0.6"])[:2]
         wf["refct"] = {"class_type": "ColorTransfer",
                        "inputs": {"image_target": ["ref", 0], "image_ref": ["parts", 0], "method": method,
@@ -282,9 +371,11 @@ def main() -> None:
         for j, xp in enumerate(extras, 1):
             xname = f"bfs_{safe}_view{j}{xp.suffix}"
             shutil.copy2(xp, inp / xname)
+            if scene_st is not None:
+                xname = scene_recolor(xp, f"view{j}")
             wf[f"xref{j}"] = {"class_type": "LoadImage", "inputs": {"image": xname}}
             src = [f"xref{j}", 0]
-            if args.ref_color:
+            if args.ref_color and scene_st is None:
                 wf[f"xct{j}"] = {"class_type": "ColorTransfer",
                                  "inputs": {"image_target": src, "image_ref": ["parts", 0], "method": method,
                                             "source_stats": "uniform", "strength": float(strength)}}
@@ -304,6 +395,27 @@ def main() -> None:
         wf["sched"]["inputs"]["model"] = ["real", 0]
         wf["r2v"]["inputs"]["prompt"] = "r34l1sm, " + wf["r2v"]["inputs"]["prompt"]
         (out / "prompt.txt").write_text(wf["r2v"]["inputs"]["prompt"] + "\n")
+    if args.upscale and args.upscale > 1.0:
+        base = ["swap", 0]
+        real = ["real", 0] if args.realism > 0 else base
+        s1 = real if args.realism_stage in ("1", "both") else base
+        s2 = real if args.realism_stage in ("2", "both") else base
+        wf["guider"]["inputs"]["model"] = s1
+        wf["sched"]["inputs"]["model"] = s1
+        w2, h2 = add_upscale(wf, args.upscale, args.width, args.height, args.frames, s2, chunk_frames=args.chunk_frames)
+        if args.from_gen:
+            # stage 2 only: the stage-1 result is an existing clip; encode it and use it instead of a new stage 1
+            gname = f"bfs_{safe}_stage1.mp4"
+            shutil.copy2(args.from_gen, inp / gname)
+            wf["s1vid"] = {"class_type": "LoadVideo", "inputs": {"file": gname}}
+            wf["s1parts"] = {"class_type": "GetVideoComponents", "inputs": {"video": ["s1vid", 0]}}
+            wf["s1enc"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["s1parts", 0], "vae": ["vvae", 0]}}
+            wf["s1empty_sep"] = {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["empty", 0]}}
+            wf["up"]["inputs"]["latent"] = ["s1enc", 0]
+            wf["s2_cat"]["inputs"]["audio_latent"] = ["s1empty_sep", 1]
+            print(f"stage 2 only, from {args.from_gen}", flush=True)
+        print(f"two-stage: {args.width}x{args.height} -> latent upscale x{args.upscale} -> {w2}x{h2}, "
+              f"realism in stage {args.realism_stage}", flush=True)
     (out / "workflow_api.json").write_text(json.dumps(wf, indent=2))
     c = cs.Comfy(args.comfy_url)
     pid = c.submit(wf)

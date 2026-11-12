@@ -51,6 +51,9 @@ get lightx2v/Qwen-Image-2.1-Lightning pytorch_lora_weights.safetensors \
 # --- YOLO11 person / pose (presence check, tone matching); ultralytics fetches them from its GitHub releases
 YD="$ROOT/ComfyUI/models/ultralytics/person"; mkdir -p "$YD"
 ( cd "$YD" && "$ROOT/.venv/bin/python" -c "from ultralytics import YOLO; YOLO('yolo11m.pt'); YOLO('yolo11m-pose.pt')" ) || rc=1
+get LBH-123-AI/Minimax_h3_latent_Upscaler minimax_h3_latent_upscaler_2d_conv_v1/minimax_h3_latent_upscaler_2d_conv_v1_fp16.safetensors \
+    latent_upscale_models/minimax_h3_latent_upscaler_2d_conv_v1_fp16.safetensors || rc=1          # UPSCALE (2D v1)
+# FaceRefine's face detector (face_yolov8m.pt) is fetched by the node on first use
 # insightface buffalo_l (target identity check) is downloaded automatically on first use
 # into ComfyUI/models/insightface/models/buffalo_l.
 

@@ -40,6 +40,13 @@ if [ -f "$COMFY/custom_nodes/h3-relay/requirements.txt" ]; then
   uv pip install -r "$COMFY/custom_nodes/h3-relay/requirements.txt"
 fi
 
+# ---------- 3b. FaceRefine (last step, on by default) and the H3 latent upscaler (UPSCALE) ----------
+for repo in Carasibana/ComfyUI-H3-FaceRefine LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler; do
+  d="$COMFY/custom_nodes/${repo#*/}"
+  [ -d "$d" ] || git clone "https://github.com/$repo.git" "$d"
+  [ -f "$d/requirements.txt" ] && uv pip install -r "$d/requirements.txt"
+done
+
 # ---------- 4. Pipeline Python deps ----------
 # ultralytics: YOLO11 person/head presence + tone matching; insightface: target identity check;
 # scenedetect: CUTS=auto. Keep ONLY onnxruntime-gpu: the CPU package would shadow it.

@@ -234,7 +234,7 @@ def split_by_presence(bounds: list, pf: list, gap: int, min_run: int, min_seg: i
                 r.append((i, j, x[i])); i = j
             return r
         for i, j, v in runs(x):                                   # drop short presence blips
-            if v == 1 and j - i < min_run:
+            if v == 1 and j - i < min_run and j - i < len(x):    # a flash shot (1-2 frames) is all presence
                 x[i:j] = [0] * (j - i)
         if any(x):
             for i, j, v in runs(x):                               # fill short gaps (also at shot start/end)
@@ -256,9 +256,67 @@ def split_by_presence(bounds: list, pf: list, gap: int, min_run: int, min_seg: i
     return nb, flag
 
 
-def auto_cuts(video: Path) -> str:
+def face_fraction(video: Path, shots: list, every: int = 2, min_score: float = 0.5) -> dict:
+    """Per shot, the fraction of sampled source frames with any detected face (insightface detection)."""
+    import logging
+    logging.getLogger("insightface").setLevel(logging.ERROR)
+    from insightface.app import FaceAnalysis
+    app = FaceAnalysis(name="buffalo_l", root=str(ROOT / "ComfyUI" / "models" / "insightface"),
+                       allowed_modules=["detection"], providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=-1, det_size=(640, 640))
+    out = {}
+    for i, (a, e) in enumerate(shots, 1):
+        frames = read_frames(video, a, e)[::every]
+        out[i] = sum(any(f.det_score > min_score for f in app.get(fr)) for fr in frames) / max(1, len(frames))
+    return out
+
+
+def auto_cuts(video: Path, sensitivity: float = 1.5, min_change: float = 0.38, window: int = 6) -> str:
+    """Scene cuts in two steps. 1) PySceneDetect AdaptiveDetector at a sensitive threshold (1.5 instead of 3.0), so
+    dissolves and cuts between similar shots are not missed (a missed cut makes the model draw the person into a
+    shot without them). 2) Each candidate is kept only if the colour content really changes: Bhattacharyya
+    distance between HSV histograms of the `window` frames before and after it >= min_change (fast motion such as
+    hair or arms trips step 1 but keeps the colours). Tuned on 3 hand-labelled clips: all 29 real cuts kept,
+    10 of 11 false candidates dropped. 3) Single flash frames (1-2 frames of another shot) get their own cuts."""
     from scenedetect import detect, AdaptiveDetector
-    return ",".join(str(sc[0].frame_num) for sc in detect(str(video), AdaptiveDetector())[1:])
+    cand = [sc[0].frame_num for sc in detect(str(video), AdaptiveDetector(adaptive_threshold=sensitivity,
+                                                                          min_scene_len=8))[1:]]
+    cap = cv2.VideoCapture(str(video)); fr = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        fr.append(cv2.cvtColor(cv2.resize(f, (160, 90)), cv2.COLOR_BGR2HSV))
+
+    def hist(fs):
+        h = sum(cv2.calcHist([f], [0, 1, 2], None, [16, 8, 8], [0, 180, 0, 256, 0, 256]) for f in fs)
+        return cv2.normalize(h, None).flatten()
+
+    cuts = []
+    for c in cand:
+        d = cv2.compareHist(hist(fr[max(0, c - window):c]), hist(fr[c:c + window]), cv2.HISTCMP_BHATTACHARYYA)
+        print(f"  cut candidate {c}: change {d:.2f} -> {'cut' if d >= min_change else 'ignored (motion)'}")
+        if d >= min_change:
+            cuts.append(c)
+    # 3) flash frames: 1-2 frames of another shot inserted into a scene (an editing effect). The detector's minimum
+    #    shot length hides them, but a flash of the original person in a kept shot shows her. Signature: the
+    #    flash differs from the frames on both sides (mean grey difference >= 2.5/255), while the two sides are
+    #    much closer to each other (<= half of that) - normal motion makes the k-1 -> k+L difference larger.
+    g = [cv2.cvtColor(cv2.cvtColor(f, cv2.COLOR_HSV2BGR), cv2.COLOR_BGR2GRAY).astype(np.float32) for f in fr]
+    pd = lambda i, j: float(np.abs(g[i] - g[j]).mean())
+    k = 1
+    while k < len(fr) - 1:
+        for L in (1, 2):
+            if k + L >= len(fr):
+                continue
+            edge = min(pd(k - 1, k), pd(k + L - 1, k + L))
+            if edge >= 2.5 and pd(k - 1, k + L) <= 0.5 * edge and all(abs(k - c) > 2 for c in cuts):
+                print(f"  flash frames {k}-{k + L - 1}: cut around them")
+                cuts += [k, k + L]
+                k += L
+                break
+        k += 1
+    return ",".join(map(str, sorted(set(cuts))))
 
 
 def main() -> None:
@@ -286,6 +344,15 @@ def main() -> None:
     ap.add_argument("--keep-outfit", action="store_true", help="face-only reference: keep the guide's clothing")
     ap.add_argument("--face-only", action="store_true", help="swap only the face (combine with --subject face)")
     ap.add_argument("--ref-extra", default="", help="comma-separated extra character views (character sheet)")
+    ap.add_argument("--ref-color-scene", action="store_true", help="reference colour from the scene only")
+    ap.add_argument("--ref-color-mode", default="scene", help="scene | scene_lum | skin (see run_bfs.py)")
+    ap.add_argument("--upscale", type=float, default=0.0, help="two-stage latent upscale factor (0 = off)")
+    ap.add_argument("--realism-stage", default="both", help="with --upscale: Realism LoRA in stage 1, 2 or both")
+    ap.add_argument("--ref-face", default="",
+                    help="comma-separated face references (face photo, face close-up); added only to shots where a "
+                         "face is visible in the source - in back views they pull the framing to a face portrait")
+    ap.add_argument("--ref-back", default="", help="back-view reference: becomes <Picture 1> in shots without a face")
+    ap.add_argument("--min-face", type=float, default=0.2, help="--ref-face: face visible in >= this fraction")
     ap.add_argument("--check-only", action="store_true", help="run the target check, print decisions, exit")
     ap.add_argument("--ref", type=Path, required=True)
     ap.add_argument("--details", required=True)
@@ -397,6 +464,15 @@ def main() -> None:
                                                 args.comfy_urls.split(",")[0])
         print(f"shot {i}: {n24} frames -> generate {target} (incl. sacrificial frame 0)")
 
+    face_frac = {}
+    if args.ref_face:
+        todo_ = [i for i in plan if i not in keep]
+        ff = face_fraction(args.video, shots)
+        for i in todo_:
+            face_frac[i] = ff[i]
+            print(f"shot {i}: face visible in {ff[i]:.0%} -> face refs {'on' if ff[i] >= args.min_face else 'off'}",
+                  flush=True)
+
     urls = queue.Queue()
     for u in args.comfy_urls.split(","):
         urls.put(u.strip())
@@ -424,13 +500,31 @@ def main() -> None:
                 cmd += ["--realism", str(args.realism)]
             if args.ref_color:
                 cmd += ["--ref-color", args.ref_color]
+                if args.ref_color_scene:
+                    cmd += ["--ref-color-scene", "--ref-color-mode", args.ref_color_mode]
             cmd += ["--seed", str(args.seed)]
             if args.keep_outfit:
                 cmd += ["--keep-outfit"]
             if args.face_only:
                 cmd += ["--face-only"]
-            if args.ref_extra:
-                cmd += ["--ref-extra", args.ref_extra]
+            extra = [x for x in args.ref_extra.split(",") if x]
+            if args.ref_face and face_frac.get(i, 0) >= args.min_face:
+                extra += [x for x in args.ref_face.split(",") if x]
+            elif args.ref_back and args.ref_face and face_frac.get(i, 0) < args.min_face:
+                # no face in the shot (back view, distant figure): the back view leads as <Picture 1>; with the front
+                # view first the model drew a large frontal portrait instead of a small figure walking away
+                extra = [str(args.ref)] + [x for x in extra if x != args.ref_back]
+                cmd[cmd.index("--ref") + 1] = args.ref_back
+                print(f"shot {i}: no face -> back view leads the references", flush=True)
+            if extra:
+                cmd += ["--ref-extra", ",".join(extra)]
+            if args.upscale and args.upscale > 1.0:
+                cmd += ["--upscale", str(args.upscale), "--realism-stage", args.realism_stage]
+                src_job = os.environ.get("CHAR_SWAP_FROM_JOB", "")      # stage 2 only, on an existing job's results
+                if src_job:
+                    gens = sorted((OUT_ROOT / src_job / f"shot{i:02d}").glob("save_*.mp4"), key=lambda p: p.stat().st_mtime)
+                    if gens:
+                        cmd += ["--from-gen", str(gens[-1])]
             if plan[i].get("tref"):
                 cmd += ["--target-ref", str(plan[i]["tref"])]
             print(f"shot {i}: generating on {u}", flush=True)

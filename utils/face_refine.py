@@ -7,11 +7,19 @@ For every shot of the clip (cut points as in bfs_full.py):
   H3 Inject Video Latent + H3 Per-Frame Denoise -> img2img re-render of the crop with H3 R2V (+ <Picture 1> = her
                            face), low denoise, stronger where the face is small
   H3 Face Stitch Back   -> pastes only the face box back, colour-matched and feathered
+  identity guard        -> per frame, ArcFace similarity to --face-ref of the refined vs the unrefined face; where
+                           the refined face is worse by more than --guard-margin (or lost), that frame cross-fades
+                           back to the unrefined one (FaceRefine occasionally distorts a face at a shot edge)
+Shots shorter than --min-shot frames are not refined (too short for a stable track).
 Optionally stacks fal/MiniMax-H3-Realism-People-LoRA in the refine pass (--realism).
-Shots listed in --keep (default 1,3: back view / source shot) are copied through. Original audio on the result.
+Shots listed in --keep are copied through (shots without the person). Output keeps the input size; original audio.
+
+Shot mode (--shots-job): refine every generated shot clip <job>/shotNN/save_*.mp4 as one shot and write
+<--out>/shotNN/save_fr_shotNN_00001_.mp4 (a job folder that CHAR_SWAP_FROM_JOB can upscale), no assembly.
 
 Usage:
-  python face_refine.py --clip outputs/final_bfs_manlock/hug_scene_swapped_720p.mp4 --out outputs/final_bfs_manlock_fr \
+  python utils/face_refine.py --clip cases/x/output/final/swapped.mp4 --source cases/x/input/video.mp4 \
+      --face-ref cases/x/input/face.png --cuts 37,163,... --keep 6 --out cases/x/output/final_fr \
       [--realism 0.8] [--denoise 0.4]
 """
 from __future__ import annotations
@@ -29,10 +37,9 @@ ROOT = Path(__file__).resolve().parent.parent   # project root
 sys.path.insert(0, str(ROOT))
 from utils import comfy_client as cs  # noqa: E402
 
-PROMPT = ("{trigger}Close-up of <Subject 1>, the young woman shown in <Picture 1>: same face, same identity, fair skin "
-          "with natural texture and fine pores, dark brown eyes, small nose, soft pink lips, long straight wine-red "
-          "hair with blunt bangs. Natural micro-expressions, natural blinking, realistic eyes and teeth, lighting and "
-          "colour exactly as in the source footage, cinematic, photorealistic.")
+PROMPT = ("{trigger}Close-up of <Subject 1>, the person shown in <Picture 1>: exactly the same face and identity as "
+          "<Picture 1>{details}, skin with natural texture and fine pores. Natural micro-expressions, natural blinking, "
+          "realistic eyes and teeth, lighting and colour exactly as in the source footage, cinematic, photorealistic.")
 
 
 def build(video: str, face: str, prompt: str, denoise: float, steps: int, seed: int, realism: float,
@@ -98,18 +105,93 @@ def build(video: str, face: str, prompt: str, denoise: float, steps: int, seed: 
     return wf
 
 
+_FACE_APP = None
+
+
+def _face_app():
+    global _FACE_APP
+    if _FACE_APP is None:
+        import logging
+        logging.getLogger("insightface").setLevel(logging.ERROR)
+        from insightface.app import FaceAnalysis
+        _FACE_APP = FaceAnalysis(name="buffalo_l", root=str(ROOT / "ComfyUI" / "models" / "insightface"),
+                                 allowed_modules=["detection", "recognition"], providers=["CPUExecutionProvider"])
+        _FACE_APP.prepare(ctx_id=-1, det_size=(640, 640))
+    return _FACE_APP
+
+
+def _read_frames(path: Path) -> list:
+    import cv2
+    cap = cv2.VideoCapture(str(path)); fr = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        fr.append(f)
+    return fr
+
+
+def _best_sim(app, frame, ref) -> float:
+    """Highest ArcFace cosine of any face in the frame to the reference; -1 if no face is found."""
+    import cv2
+    import numpy as np
+    h, w = frame.shape[:2]
+    sc = 960 / max(h, w)
+    small = cv2.resize(frame, (int(w * sc), int(h * sc))) if sc < 1 else frame
+    return max((float(np.dot(f.normed_embedding, ref)) for f in app.get(small)), default=-1.0)
+
+
+def identity_guard(unrefined: Path, refined: Path, ref, out: Path, margin: float, lock, log: Path | None = None
+                   ) -> tuple[int, int]:
+    """Cross-fade refined frames whose identity dropped (vs the unrefined frame) back to the unrefined frame.
+    Returns (frames touched, total frames)."""
+    import numpy as np
+    a, b = _read_frames(unrefined), _read_frames(refined)
+    n = min(len(a), len(b))
+    with lock:                                   # insightface on CPU, one shot at a time
+        app = _face_app()
+        sa = np.array([_best_sim(app, a[k], ref) for k in range(n)])
+        sb = np.array([_best_sim(app, b[k], ref) for k in range(n)])
+    bad = (sa > 0) & (sb < sa - margin)          # refined face clearly worse than before, or lost
+    keep = np.ones(n)
+    for k in np.flatnonzero(bad):                # revert the bad frame and its neighbours, ramp the switch
+        keep[max(0, k - 2):k + 3] = 0
+    alpha = np.convolve(np.pad(keep, 2, mode="edge"), np.ones(5) / 5, mode="valid")
+    alpha[bad] = 0.0
+    if log is not None:
+        log.write_text("frame,sim_before,sim_after,alpha\n" +
+                       "".join(f"{k},{sa[k]:.3f},{sb[k]:.3f},{alpha[k]:.2f}\n" for k in range(n)))
+    h, w = b[0].shape[:2]
+    p = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                          "-s", f"{w}x{h}", "-r", "24", "-i", "-", "-c:v", "libx264", "-crf", "12",
+                          "-pix_fmt", "yuv420p", str(out)], stdin=subprocess.PIPE)
+    for k in range(n):
+        f = b[k] if alpha[k] >= 1 else (alpha[k] * b[k] + (1 - alpha[k]) * a[k]).astype(np.uint8)
+        p.stdin.write(np.ascontiguousarray(f).tobytes())
+    p.stdin.close(); p.wait()
+    return int((alpha < 1).sum()), n
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--clip", type=Path, required=True, help="assembled 1280x720 swap clip (24 fps)")
-    ap.add_argument("--source", type=Path, required=True, help="the source video (for the original audio)")
+    ap.add_argument("--clip", type=Path, default=None, help="assembled swap clip (24 fps, any size)")
+    ap.add_argument("--source", type=Path, default=None, help="the source video (for the original audio)")
     ap.add_argument("--face-ref", type=Path, required=True, help="face image of the new character")
-    ap.add_argument("--cuts", default="26,73,110,149,204", help="shot boundaries in the 24 fps clip")
-    ap.add_argument("--keep", default="1,3",
-                    help="shots copied through untouched (1: only her back is visible, the one face in shot is his)")
+    ap.add_argument("--cuts", default="", help="shot boundaries in the 24 fps clip")
+    ap.add_argument("--keep", default="", help="shots copied through untouched (no person / no visible face)")
+    ap.add_argument("--details", default="", help="short face/hair description of the character")
     ap.add_argument("--denoise", type=float, default=0.4)
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--realism", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--guard-margin", type=float, default=0.08,
+                    help="revert a frame whose ArcFace similarity drops more than this after refining (<0: off)")
+    ap.add_argument("--min-shot", type=int, default=24, help="shots shorter than this (frames) are not refined")
+    ap.add_argument("--shots-job", type=Path, default=None,
+                    help="shot mode: refine each <job>/shotNN/save_*.mp4 (shots listed in --only, or all)")
+    ap.add_argument("--only", default="", help="shot mode: shot numbers to refine")
+    ap.add_argument("--guard-only", type=Path, default=None,
+                    help="skip ComfyUI: apply the guard to already refined shots s<N>.mp4 in this folder")
     ap.add_argument("--comfy-urls", default="http://127.0.0.1:8188,http://127.0.0.1:8189,http://127.0.0.1:8190")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
@@ -119,22 +201,45 @@ def main() -> None:
     tag = out.name
     fname = f"fr_{tag}_face{args.face_ref.suffix}"
     shutil.copy2(args.face_ref, inp / fname)
-    prompt = PROMPT.format(trigger="r34l1sm, " if args.realism > 0 else "")
+    prompt = PROMPT.format(trigger="r34l1sm, " if args.realism > 0 else "",
+                           details=f" ({args.details.strip().rstrip('.')})" if args.details else "")
     (out / "prompt.txt").write_text(prompt + "\n")
 
-    # split the clip into shots (frame-exact, re-encoded)
-    n_total = int(subprocess.check_output(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-                                           "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
-                                           str(args.clip)]).decode().strip())
-    b = [0] + [int(c) for c in args.cuts.split(",")] + [n_total]
+    def nframes(v: Path) -> int:
+        return int(subprocess.check_output(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                                            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
+                                            str(v)]).decode().strip())
+
     keep = {int(k) for k in args.keep.split(",") if k}
-    shots = {}
-    for i in range(len(b) - 1):
-        p = out / f"in_s{i + 1}.mp4"
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(args.clip), "-vf",
-                        f"select='between(n\\,{b[i]}\\,{b[i + 1] - 1})',setpts=N/24/TB", "-r", "24", "-an",
-                        "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", str(p)], check=True)
-        shots[i + 1] = p
+    shots, length = {}, {}
+    if args.shots_job:                          # shot mode: the generated clips are the shots
+        only = {int(k) for k in args.only.split(",") if k}
+        for d in sorted(args.shots_job.glob("shot[0-9][0-9]")):
+            i = int(d.name[4:]); gens = sorted(d.glob("save_*.mp4"), key=lambda q: q.stat().st_mtime)
+            if gens and (not only or i in only):
+                p = out / f"in_s{i}.mp4"
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(gens[-1]), "-r", "24", "-an",
+                                "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", str(p)], check=True)
+                shots[i] = p; length[i] = nframes(p)
+    else:
+        if not (args.clip and args.source and args.cuts):
+            sys.exit("--clip, --source and --cuts are required (or use --shots-job)")
+        b = [0] + [int(c) for c in args.cuts.split(",")] + [nframes(args.clip)]
+        for i in range(len(b) - 1):     # split the clip into shots (frame-exact, re-encoded)
+            p = out / f"in_s{i + 1}.mp4"
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(args.clip), "-vf",
+                            f"select='between(n\\,{b[i]}\\,{b[i + 1] - 1})',setpts=N/24/TB", "-r", "24", "-an",
+                            "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", str(p)], check=True)
+            shots[i + 1] = p; length[i + 1] = b[i + 1] - b[i]
+    import threading
+    guard_lock = threading.Lock()
+    ref = None
+    if args.guard_margin >= 0 or args.guard_only:
+        import cv2
+        fs = _face_app().get(cv2.imread(str(args.face_ref)))
+        if not fs:
+            sys.exit(f"no face found in {args.face_ref}")
+        ref = max(fs, key=lambda f: f.det_score).normed_embedding
 
     urls = queue.Queue()
     for u in args.comfy_urls.split(","):
@@ -142,8 +247,15 @@ def main() -> None:
 
     def run(i: int) -> Path:
         res = out / f"s{i}.mp4"
-        if i in keep:
+        if i in keep or length[i] < args.min_shot:
+            if i not in keep:
+                print(f"shot {i}: {length[i]} frames < --min-shot -> unrefined", flush=True)
             shutil.copy2(shots[i], res)
+            return res
+        if args.guard_only:
+            nrev, nf = identity_guard(shots[i], args.guard_only / f"s{i}.mp4", ref, res, args.guard_margin,
+                                      guard_lock, out / f"guard_s{i}.csv")
+            print(f"shot {i}: identity guard reverted {nrev}/{nf} frames", flush=True)
             return res
         u = urls.get()
         try:
@@ -160,8 +272,13 @@ def main() -> None:
             for node in hist.get("outputs", {}).values():          # tracker report, for diagnosis
                 for t in node.get("text", []) if isinstance(node, dict) else []:
                     (out / f"report_s{i}.txt").write_text(str(t))
-            shutil.copy2(files[-1], res)
-            print(f"shot {i}: done", flush=True)
+            if args.guard_margin >= 0:
+                nrev, nf = identity_guard(shots[i], Path(files[-1]), ref, res, args.guard_margin, guard_lock,
+                                          out / f"guard_s{i}.csv")
+                print(f"shot {i}: done, identity guard reverted {nrev}/{nf} frames", flush=True)
+            else:
+                shutil.copy2(files[-1], res)
+                print(f"shot {i}: done", flush=True)
             return res
         except (Exception, SystemExit) as e:  # Comfy.wait sys.exit()s on a node error; keep the unrefined shot
             msg = str(e)
@@ -174,15 +291,23 @@ def main() -> None:
             urls.put(u)
 
     with ThreadPoolExecutor(max_workers=len(args.comfy_urls.split(","))) as ex:
-        parts = list(ex.map(run, sorted(shots)))
+        parts = list(ex.map(run, sorted(shots, key=lambda i: -length[i])))
+    if args.shots_job:                          # shot mode: a job folder of refined shots, no assembly
+        for i in shots:
+            d = out / f"shot{i:02d}"; d.mkdir(exist_ok=True)
+            shutil.move(str(out / f"s{i}.mp4"), d / f"save_fr_shot{i:02d}_00001_.mp4")
+            shots[i].unlink(missing_ok=True)
+        print(f"FINAL -> {out}")
+        return
+    parts = [out / f"s{i}.mp4" for i in sorted(shots)]
     (out / "list.txt").write_text("".join(f"file '{p}'\n" for p in parts))
-    final = out / "hug_scene_swapped_720p.mp4"
+    final = out / "swapped.mp4"
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(out / "list.txt"),
-                    "-i", str(args.source), "-map", "0:v", "-map", "1:a", "-vf", "scale=1280:720",
+                    "-i", str(args.source), "-map", "0:v", "-map", "1:a",
                     "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(final)],
                    check=True)
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(args.clip), "-i", str(final), "-filter_complex",
-                    "[0:v]scale=640:360[a];[1:v]scale=640:360[b];[a][b]hstack", "-map", "1:a", "-c:v", "libx264",
+                    "[0:v]scale=-2:360[a];[1:v]scale=-2:360[b];[a][b]hstack", "-map", "1:a", "-c:v", "libx264",
                     "-crf", "18", "-pix_fmt", "yuv420p", str(out / "before_after.mp4")], check=True)
     for p in shots.values():
         p.unlink(missing_ok=True)
