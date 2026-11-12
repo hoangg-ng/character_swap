@@ -109,6 +109,60 @@ def make_target_ref(frames: list, text: str, out: Path, url: str) -> Path | None
     return out
 
 
+def load_edits(path: str) -> dict:
+    """Per-shot edits (web UI): {shot: "note"} or {shot: {"note", "take", "soft_face_scale", "keep_outfit",
+    "relight"}}. Returns {int shot: dict}."""
+    if not path or not Path(path).exists():
+        return {}
+    out = {}
+    for k, v in json.loads(Path(path).read_text()).items():
+        out[int(k)] = v if isinstance(v, dict) else {"note": str(v)}
+    return out
+
+
+def soften_faces(inp: Path, out: Path, face_px: int = 20, min_face: int = 16, lead: int = 0,
+                 small_scale: float = 0.35) -> Path | None:
+    """Guide with the original person's face softened: every face (insightface) larger than `min_face` px is
+    reduced to ~`face_px` px across and scaled back up, feathered. Position, head turn and the coarse expression
+    (eyes / mouth open or shut) stay; the identity detail is gone, so BFS has to take the face from the references
+    instead of copying the original (which it did in close-ups, depending on the seed). Only the GUIDE changes.
+    Returns None when no face is large enough (the guide stays as it is)."""
+    import logging
+    logging.getLogger("insightface").setLevel(logging.ERROR)
+    sys.path.insert(0, str(ROOT))
+    from utils.face_refine import _face_app
+    app = _face_app()
+    frames = read_frames(inp, 0, 10 ** 6)
+    boxes = []
+    for f in frames:
+        fs = [x for x in app.get(f) if x.bbox[2] - x.bbox[0] >= min_face]
+        boxes.append([x.bbox for x in fs])
+    if not any(boxes):
+        return None
+    for k in range(len(frames)):                 # fill single-frame detection gaps from the neighbours
+        if not boxes[k]:
+            boxes[k] = boxes[k - 1] if k and boxes[k - 1] else (boxes[k + 1] if k + 1 < len(boxes) else [])
+    soft = []
+    for f, bs in zip(frames, boxes):
+        g = f.copy()
+        for b in bs:
+            x0, y0, x1, y1 = b.astype(int); w, h = x1 - x0, y1 - y0
+            x0, y0 = max(0, x0 - w // 6), max(0, y0 - h // 6); x1, y1 = min(f.shape[1], x1 + w // 6), min(f.shape[0], y1 + h // 6)
+            roi = f[y0:y1, x0:x1]
+            if roi.size == 0:
+                continue
+            sc = max(4.0, min(face_px, small_scale * roi.shape[1])) / max(1, roi.shape[1])   # small faces: a fraction
+            small = cv2.resize(roi, (max(2, int(roi.shape[1] * sc)), max(2, int(roi.shape[0] * sc))), interpolation=cv2.INTER_AREA)
+            blur = cv2.GaussianBlur(cv2.resize(small, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_CUBIC), (0, 0), 2)
+            m = np.zeros(roi.shape[:2], np.float32)
+            cv2.ellipse(m, (roi.shape[1] // 2, roi.shape[0] // 2), (roi.shape[1] // 2, roi.shape[0] // 2), 0, 0, 360, 1, -1)
+            m = cv2.GaussianBlur(m, (0, 0), max(2, roi.shape[1] / 12))[..., None]
+            g[y0:y1, x0:x1] = (roi * (1 - m) + blur * m).astype(np.uint8)
+        soft.append(g)
+    write(soft, out, audio_from=inp, ss=0, t=len(soft) / 24)
+    return out
+
+
 def make_clean_guide(inp: Path, hide: str, thr: float, out: Path, url: str) -> Path:
     """SAM-track `hide` (e.g. the man) in every frame and inpaint him out -> guide where the target is the only
     person. Only the guide changes; the source video is untouched."""
@@ -271,43 +325,67 @@ def face_fraction(video: Path, shots: list, every: int = 2, min_score: float = 0
     return out
 
 
-def auto_cuts(video: Path, sensitivity: float = 1.5, min_change: float = 0.38, window: int = 6) -> str:
-    """Scene cuts in two steps. 1) PySceneDetect AdaptiveDetector at a sensitive threshold (1.5 instead of 3.0), so
-    dissolves and cuts between similar shots are not missed (a missed cut makes the model draw the person into a
-    shot without them). 2) Each candidate is kept only if the colour content really changes: Bhattacharyya
-    distance between HSV histograms of the `window` frames before and after it >= min_change (fast motion such as
-    hair or arms trips step 1 but keeps the colours). Tuned on 3 hand-labelled clips: all 29 real cuts kept,
-    10 of 11 false candidates dropped. 3) Single flash frames (1-2 frames of another shot) get their own cuts."""
+def auto_cuts(video: Path, sensitivity: float = 1.5, min_change: float = 0.38, window: int = 6,
+              same_scene: float = 0.15) -> str:
+    """Scene cuts. A missed cut is the worst error (the person is drawn into a shot without her, or her face drifts
+    across the change), so detection is sensitive and every candidate is then checked:
+      1. candidates: PySceneDetect AdaptiveDetector at 1.5 (default 3.0), shots >= 8 frames - finds dissolves and
+         cuts between similar-looking shots;
+      2. colour check: Bhattacharyya distance of the HSV histograms of the `window` frames before / after >=
+         min_change (fast motion of hair or arms trips step 1 but keeps the colours);
+      3. snap: the cut moves to the sharpest frame change within +-3 frames (the detector can land 1-2 frames late;
+         2 frames of the next shot made a sleeve-only segment count as "person visible" -> an invented face);
+      4. same-scene check: ORB features matched across the cut (frame c-1 vs c+2, and c-4 vs c+5); a real cut shares
+         almost none (<= 0.04 on 29 labelled cuts), an occluder crossing the same shot (smoke, a passer-by) keeps
+         the background (0.23) -> dropped when >= same_scene;
+      5. flash frames: 1-2 frames of another shot inserted into a scene get their own cuts (they differ from both
+         neighbours, mean grey difference >= 2.5/255, while the neighbours match each other).
+    On 3 hand-labelled clips (31 cuts incl. 2 flashes): every cut found, frame-exact except one fade frame, no extra cut."""
     from scenedetect import detect, AdaptiveDetector
     cand = [sc[0].frame_num for sc in detect(str(video), AdaptiveDetector(adaptive_threshold=sensitivity,
                                                                           min_scene_len=8))[1:]]
-    cap = cv2.VideoCapture(str(video)); fr = []
+    cap = cv2.VideoCapture(str(video)); full = []
     while True:
         ok, f = cap.read()
         if not ok:
             break
-        fr.append(cv2.cvtColor(cv2.resize(f, (160, 90)), cv2.COLOR_BGR2HSV))
+        full.append(cv2.resize(f, (480, int(480 * f.shape[0] / f.shape[1]))) if f.shape[1] > 480 else f)
+    fr = [cv2.cvtColor(cv2.resize(f, (160, 90)), cv2.COLOR_BGR2HSV) for f in full]
+    g = [cv2.cvtColor(cv2.resize(f, (160, 90)), cv2.COLOR_BGR2GRAY).astype(np.float32) for f in full]
+    n = len(fr)
+    pd = lambda i, j: float(np.abs(g[i] - g[j]).mean())
 
     def hist(fs):
         h = sum(cv2.calcHist([f], [0, 1, 2], None, [16, 8, 8], [0, 180, 0, 256, 0, 256]) for f in fs)
         return cv2.normalize(h, None).flatten()
 
+    orb, bfm = cv2.ORB_create(500), cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    def shared(i, j):           # fraction of ORB features of frame i that reappear in frame j
+        ka, da = orb.detectAndCompute(cv2.cvtColor(full[i], cv2.COLOR_BGR2GRAY), None)
+        kb, db = orb.detectAndCompute(cv2.cvtColor(full[j], cv2.COLOR_BGR2GRAY), None)
+        if da is None or db is None or min(len(ka), len(kb)) < 10:
+            return 0.0
+        return len([m for m in bfm.match(da, db) if m.distance < 40]) / min(len(ka), len(kb))
+
     cuts = []
     for c in cand:
         d = cv2.compareHist(hist(fr[max(0, c - window):c]), hist(fr[c:c + window]), cv2.HISTCMP_BHATTACHARYYA)
-        print(f"  cut candidate {c}: change {d:.2f} -> {'cut' if d >= min_change else 'ignored (motion)'}")
-        if d >= min_change:
-            cuts.append(c)
-    # 3) flash frames: 1-2 frames of another shot inserted into a scene (an editing effect). The detector's minimum
-    #    shot length hides them, but a flash of the original person in a kept shot shows her. Signature: the
-    #    flash differs from the frames on both sides (mean grey difference >= 2.5/255), while the two sides are
-    #    much closer to each other (<= half of that) - normal motion makes the k-1 -> k+L difference larger.
-    g = [cv2.cvtColor(cv2.cvtColor(f, cv2.COLOR_HSV2BGR), cv2.COLOR_BGR2GRAY).astype(np.float32) for f in fr]
-    pd = lambda i, j: float(np.abs(g[i] - g[j]).mean())
+        if d < min_change:
+            print(f"  cut candidate {c}: colour change {d:.2f} -> ignored (motion)")
+            continue
+        best = max(range(max(1, c - 3), min(n - 1, c + 3) + 1), key=lambda k: pd(k - 1, k))
+        sh = max(shared(max(0, best - 1 - o), min(n - 1, best + 2 + o)) for o in (0, 3))
+        if sh >= same_scene:
+            print(f"  cut candidate {c}: colour change {d:.2f}, but {sh:.0%} of the picture continues -> same scene")
+            continue
+        print(f"  cut {best}" + (f" (detector said {c})" if best != c else "") + f": colour change {d:.2f}, shared {sh:.0%}")
+        cuts.append(best)
+    cuts = sorted(set(cuts))
     k = 1
-    while k < len(fr) - 1:
+    while k < n - 1:
         for L in (1, 2):
-            if k + L >= len(fr):
+            if k + L >= n:
                 continue
             edge = min(pd(k - 1, k), pd(k + L - 1, k + L))
             if edge >= 2.5 and pd(k - 1, k + L) <= 0.5 * edge and all(abs(k - c) > 2 for c in cuts):
@@ -356,6 +434,7 @@ def main() -> None:
     ap.add_argument("--check-only", action="store_true", help="run the target check, print decisions, exit")
     ap.add_argument("--ref", type=Path, required=True)
     ap.add_argument("--details", required=True)
+    ap.add_argument("--shot-notes", default="", help="JSON {shot: extra instruction} appended to --details per shot")
     ap.add_argument("--target", default="the woman with long black hair in the white jacket")
     ap.add_argument("--keep-others", default="the man in the black vest and white shirt")
     ap.add_argument("--subject", default="", help="SAM text of the person to replace -> per-frame edit mask")
@@ -371,6 +450,10 @@ def main() -> None:
     ap.add_argument("--height", type=int, default=736)
     ap.add_argument("--target-ref-text", default="",
                     help="SAM text of the person to replace; a cut-out of her from the shot becomes <Picture 2>")
+    ap.add_argument("--soft-face-scale", type=float, default=0.15, help="small faces are reduced to this fraction")
+    ap.add_argument("--face-lead", action="store_true", help="in shots with a visible face the face photo is <Picture 1>")
+    ap.add_argument("--soften-face", action="store_true",
+                    help="soften the original person's face in the guide (identity removed, pose/expression kept)")
     ap.add_argument("--hide", default="", help="SAM text of people to remove from the GUIDE only, e.g. 'man'")
     ap.add_argument("--hide-threshold", type=float, default=0.7)
     ap.add_argument("--lead", type=int, default=5, help="sacrificial copies of the first frame (one latent group)")
@@ -437,6 +520,7 @@ def main() -> None:
         solo = set(range(1, len(shots) + 1))          # nobody else to keep: no "keep the others" prompt note
     work = OUT_ROOT / args.job
     work.mkdir(parents=True, exist_ok=True)
+    edits = load_edits(args.shot_notes)
 
     plan = {}
     for i, (a, e) in enumerate(shots, 1):
@@ -462,6 +546,13 @@ def main() -> None:
         if args.hide and (not args.only or str(i) in args.only.split(",")):
             plan[i]["guide"] = make_clean_guide(inp, args.hide, args.hide_threshold, work / f"shot{i:02d}_guide.mp4",
                                                 args.comfy_urls.split(",")[0])
+        if args.soften_face and "guide" not in plan[i] and (not args.only or str(i) in args.only.split(",")):
+            sg = soften_faces(inp, work / f"shot{i:02d}_guide_softface.mp4",
+                              small_scale=float(edits.get(i, {}).get("soft_face_scale", args.soft_face_scale)),
+                              face_px=int(edits.get(i, {}).get("soft_face_px", 20)))
+            if sg:
+                plan[i]["guide"] = sg
+                print(f"shot {i}: original face softened in the guide", flush=True)
         print(f"shot {i}: {n24} frames -> generate {target} (incl. sacrificial frame 0)")
 
     face_frac = {}
@@ -477,12 +568,16 @@ def main() -> None:
     for u in args.comfy_urls.split(","):
         urls.put(u.strip())
 
+    def details_for(i: int) -> str:      # per-shot instruction (web UI "edit this shot") appended to the description
+        note = str(edits.get(i, {}).get("note", "")).strip()
+        return args.details if not note else f"{args.details.rstrip('. ')}. In this shot: {note}"
+
     def run(i):
         u = urls.get()
         try:
             job = f"{args.job}/shot{i:02d}"
             cmd = [str(ROOT / ".venv/bin/python"), "-u", str(ROOT / "run_bfs.py"), "--video", str(plan[i]["inp"]),
-                   "--ref", str(args.ref), "--details", args.details, "--width", str(W), "--height", str(H),
+                   "--ref", str(args.ref), "--details", details_for(i), "--width", str(W), "--height", str(H),
                    "--frames", str(plan[i]["length"]), "--job", job, "--comfy-url", u]
             if i not in solo and args.target:
                 cmd += ["--target", args.target, "--keep-others", args.keep_others]
@@ -502,14 +597,21 @@ def main() -> None:
                 cmd += ["--ref-color", args.ref_color]
                 if args.ref_color_scene:
                     cmd += ["--ref-color-scene", "--ref-color-mode", args.ref_color_mode]
-            cmd += ["--seed", str(args.seed)]
-            if args.keep_outfit:
+            cmd += ["--seed", str(args.seed + int(edits.get(i, {}).get("take", 0)))]      # "take": a new variation
+            if edits.get(i, {}).get("keep_outfit", args.keep_outfit):
                 cmd += ["--keep-outfit"]
             if args.face_only:
                 cmd += ["--face-only"]
             extra = [x for x in args.ref_extra.split(",") if x]
             if args.ref_face and face_frac.get(i, 0) >= args.min_face:
-                extra += [x for x in args.ref_face.split(",") if x]
+                fr_ = [x for x in args.ref_face.split(",") if x]
+                if args.face_lead:            # face visible: her real face photo leads the references as <Picture 1>
+                    lead_ = fr_[-1]
+                    extra = [str(args.ref)] + extra + [x for x in fr_ if x != lead_]
+                    cmd[cmd.index("--ref") + 1] = lead_
+                    print(f"shot {i}: face visible -> face photo leads the references", flush=True)
+                else:
+                    extra += fr_
             elif args.ref_back and args.ref_face and face_frac.get(i, 0) < args.min_face:
                 # no face in the shot (back view, distant figure): the back view leads as <Picture 1>; with the front
                 # view first the model drew a large frontal portrait instead of a small figure walking away

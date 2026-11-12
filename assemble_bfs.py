@@ -61,6 +61,10 @@ def main() -> None:
                     help="re-apply the source's black letterbox bars (detected per shot) with a small margin; BFS "
                          "paints into the bars and leaves a dark line at the bar edge")
     ap.add_argument("--bar-margin", type=int, default=3)
+    ap.add_argument("--shot-edits", default="", help="per-shot edits JSON (web UI); uses its 'relight' values")
+    ap.add_argument("--relight", type=float, default=0.0,
+                    help="re-light generated shots with the source's broad light (utils/relight.py), 0-1; replaces "
+                         "--tone-person when > 0")
     ap.add_argument("--tone-person", type=float, default=0.0,
                     help="strength (0-1) of matching the generated person's tone to the original person "
                          "(tone_match.py), applied only to shots where the generated person is clearly brighter")
@@ -122,7 +126,34 @@ def main() -> None:
                                          interpolation=cv2.INTER_LANCZOS4))
             how = "SAM-mask composite" if masks else ("man restored from source" if prot else "raw (no composite)")
             log[i] = f"{gen_p} | lead {lead} | {how}"
-            if args.tone_person > 0:
+            rl = args.relight
+            if args.shot_edits and Path(args.shot_edits).exists():        # per-shot re-light strength (web UI)
+                e_ = json.loads(Path(args.shot_edits).read_text()).get(str(i), {})
+                if isinstance(e_, dict) and "relight" in e_:
+                    rl = float(e_["relight"])
+            if rl > 0:
+                from utils.relight import relight_frame
+                srcs = [cv2.resize(srcin[min(k, len(srcin) - 1)], (OW, OH)) for k in range(lead, lead + n)]
+                frames = [relight_frame(sf, f, rl) for f, sf in zip(frames, srcs)]
+                log[i] += f" | relit x{rl}"
+                # silhouette shot (the original person is nearly black): the generated person may stand slightly
+                # differently, so the light map alone leaves a lit face edge; darken her whole outline to the
+                # original person's level (tight outline, no halo) -> a silhouette with the NEW character's shape
+                from utils import tone_match as tm
+                lv, lg = [], []
+                for sf, gf in list(zip(srcs, frames))[::6]:
+                    m_, _ = tm.person_mask(sf); g_, _ = tm.person_mask(gf)
+                    if m_ is not None and m_.sum() > 50 and g_ is not None and g_.sum() > 50:
+                        lv.append(float(np.median(cv2.cvtColor(sf, cv2.COLOR_BGR2LAB)[..., 0][m_])))
+                        lg.append(float(np.median(cv2.cvtColor(gf, cv2.COLOR_BGR2LAB)[..., 0][g_])))
+                if lv and np.median(lv) < 10:
+                    frames = [tm.tone_frame(sf, f, 1.0) for f, sf in zip(frames, srcs)]
+                    log[i] += f" | silhouette (person L {np.median(lv):.0f}) toned"
+                elif lv and np.median(lv) < 40 and np.median(lg) > 2 * np.median(lv):
+                    # dark shot where the model drew the person far too bright (scene-only light leaves her as is)
+                    frames = [tm.tone_frame(sf, f, 1.0, fabric=True) for f, sf in zip(frames, srcs)]
+                    log[i] += f" | dark shot, person toned ({np.median(lg):.0f} -> source {np.median(lv):.0f})"
+            elif args.tone_person > 0:
                 from utils import tone_match as tm
                 srcs = [cv2.resize(srcin[min(k, len(srcin) - 1)], (OW, OH)) for k in range(lead, lead + n)]
                 lg, ls = [], []
@@ -133,8 +164,10 @@ def main() -> None:
                         ls.append(cv2.cvtColor(sf[bs_[1]:bs_[3], bs_[0]:bs_[2]], cv2.COLOR_BGR2LAB)[..., 0].mean())
                 ratio = float(np.mean(lg) / max(np.mean(ls), 1.0)) if lg else 1.0
                 if ratio > args.tone_trigger:
-                    frames = [tm.tone_frame(sf, f, args.tone_person) for f, sf in zip(frames, srcs)]
-                    log[i] += f" | person toned (generated {ratio:.2f}x brighter)"
+                    dark = ratio >= 2.0               # far too bright (dark scenes): full strength, sleeves included
+                    st = 1.0 if dark else args.tone_person
+                    frames = [tm.tone_frame(sf, f, st, fabric=dark) for f, sf in zip(frames, srcs)]
+                    log[i] += f" | person toned x{st} (generated {ratio:.2f}x brighter)"
         if args.letterbox and i in given:
             # rows that are black in every source frame of this shot = letterbox bars
             rm = np.stack([cv2.resize(f, (OW, OH)).mean(axis=(1, 2)) for f in src]).max(axis=0)
@@ -154,9 +187,6 @@ def main() -> None:
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(args.out / "list.txt"),
                     "-i", str(args.video), "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-crf", "16",
                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(final)], check=True)
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(args.video), "-i", str(final), "-filter_complex",
-                    "[0:v]scale=-2:360[a];[1:v]scale=-2:360[b];[a][b]hstack", "-map", "1:a", "-c:v", "libx264",
-                    "-crf", "18", "-pix_fmt", "yuv420p", str(args.out / "side_by_side.mp4")], check=True)
     json.dump({str(k): v for k, v in log.items()}, open(args.out / "picks.json", "w"), indent=1)
     print(f"FINAL -> {final}")
 

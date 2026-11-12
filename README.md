@@ -70,27 +70,29 @@ PROTECT=${PROTECT-}                                    # people to keep unchange
 | 6 | **Sampling** | `SamplerCustomAdvanced` | euler, simple scheduler, 8 steps, CFG 1. The whole frame is generated, guided by the original shot; locked people keep their latent. |
 | 6b | **Upscale** (`UPSCALE`, optional) | H3 latent upscaler (`LBH-123-AI`, 2D v1) + refine pass | The stage-1 latent is upscaled (1.5 = 480p → 720p) and refined at the new size with 3 steps (sigmas 0.90 → 0.63 → 0.32), same references and guide, long shots in 73-frame chunks. The Realism LoRA goes in this pass (`REALISM_STAGE=2`, default), where its skin and hair detail has the pixels to show. The result keeps the higher resolution. |
 | 7 | **Assembly** | `assemble_bfs.py --raw --letterbox --tone-person` | Drops the lead frames, trims to the shot's length and scales back to the source size. Uses the **pure generated frames** (pasting locked people back from the source only adds a visible edge). Re-applies the source's letterbox bars, and in shots where the generated person is much brighter than the original (dark, low-key shots) matches her tone to the original person. |
-| 8 | **Final cut** | `scripts/run_swap.sh` | Generated and source shots are concatenated with the source audio, plus a `side_by_side.mp4`. Optional `SPLICE="N=clip.mp4"` replaces a shot with a prepared clip. Cropped bars (`CROP`) are padded back. |
+| 8 | **Final cut** | `scripts/run_swap.sh` | Generated and source shots are concatenated with the source audio. Optional `SPLICE="N=clip.mp4"` replaces a shot with a prepared clip. Cropped bars (`CROP`) are padded back. |
 | 9 | **FaceRefine + identity guard** (default on) | `utils/face_refine.py` (`Carasibana/ComfyUI-H3-FaceRefine`) | Per generated shot: tracks her face (identity from `FACE_REFINE_REF`), re-renders the face crop with low denoise and pastes it back. Then the **identity guard** compares every refined frame with the frame before refining (ArcFace similarity to `FACE_REFINE_REF`): if the refined face is worse by more than 0.08, or lost, that frame cross-fades back to the unrefined one. Shots shorter than 24 frames are not refined. Runs last, because any later generation pass would re-render the face. |
 
 ### Scene cuts (`CUTS=auto`)
-A missed cut is the most damaging error: the shot is generated as one clip, so the model draws the person
-into a scene without her (e.g. over a close-up of a hand) and her face drifts toward the original across
-the scene change. `auto_cuts` in `bfs_full.py` therefore works in two steps:
-1. **Candidates:** PySceneDetect `AdaptiveDetector` at a sensitive threshold (1.5 instead of the default 3.0,
-   minimum shot 8 frames), so dissolves and cuts between similar-looking shots are found.
-2. **Verification:** each candidate is kept only if the colour content really changes: Bhattacharyya distance
-   between the HSV histograms of the 6 frames before and after it ≥ 0.38. Fast motion (hair, arms) triggers
-   step 1 but keeps the colours, so those candidates are dropped. Each decision is printed.
+A missed or misplaced cut is the most damaging error: the shot is generated as one clip, so the model draws the
+person into a scene without her (e.g. over a close-up of a hand) and her face drifts toward the original across
+the change. `auto_cuts` in `bfs_full.py` detects sensitively and then checks every candidate:
+1. **Candidates:** PySceneDetect `AdaptiveDetector` at 1.5 (default 3.0), shots ≥ 8 frames, so dissolves and
+   cuts between similar-looking shots are found.
+2. **Colour check:** Bhattacharyya distance between the HSV histograms of the 6 frames before and after ≥ 0.38.
+   Fast motion (hair, arms) triggers step 1 but keeps the colours.
+3. **Snap:** the cut moves to the sharpest frame change within ±3 frames. The detector can land 1–2 frames late;
+   2 frames of the next shot (her head) made a sleeve-only segment count as "person visible", and a face was
+   invented there.
+4. **Same-scene check:** ORB features matched across the cut. A real cut shares almost none (≤ 5% on all
+   labelled cuts); an occluder crossing the same shot (a puff of smoke) keeps the background (27%) and is dropped
+   (threshold 15%).
+5. **Flash frames:** 1–2 frames of another shot cut into a scene (e.g. the original person flashing up in fog)
+   are too short for step 1. A frame that differs from both neighbours (mean grey difference ≥ 2.5/255) while the
+   neighbours are close to each other (≤ half of that) gets its own cuts, so it is generated, not kept.
 
-3. **Flash frames:** 1–2 frames of another shot cut into a scene (an editing effect, e.g. the original person
-   flashing up in fog) are too short for step 1. A frame that differs from both neighbours (mean grey difference
-   ≥ 2.5/255) while the neighbours are close to each other (≤ half of that) gets its own cuts, so the target check
-   can generate it (a still clip of that frame) instead of keeping the original person.
-
-On three hand-labelled clips this finds all 29 real cuts and both flash frames, with 1 extra cut; the old
-default detector missed 5 cuts and every flash. An extra cut only splits one scene into two generations.
-Hand-set `CUTS` in `case.env` always win.
+On three hand-labelled clips (33 cuts including 2 flash frames) every cut is found, all frame-exact except one
+fade frame (728 instead of 727), with no extra cut. Each decision is printed. Hand-set `CUTS` in `case.env` win.
 
 ### Character sheet (recommended reference)
 **Built automatically as the first step** when `case.env` sets `SHEET_PERSON` (a cut-out of the character)
@@ -182,7 +184,7 @@ close-up +14 vs +31. Not implemented: an automatic redness check after generatio
 | `TONE_PERSON` (0.8) | assembly post-process (`utils/tone_match.py`): where the generated person is > 1.25x brighter than the original, her LAB tone is matched to the original person inside her box, feathered. Normally lit shots are left alone so the new identity keeps its colours |
 | `LIGHT_MATCH=1` | adds a lighting-match sentence to the prompt (off by default; did not help in tests) |
 | `UPSCALE` (1.5) / `REALISM_STAGE` (2) | two-stage generation (step 6b): `UPSCALE=1.5` gives 720p from 480p (standard), `0` = 480p only for quick tests; 2.25 gives 1080p but takes ~3x the time of the 480p generation. `REALISM_STAGE=1/2/both` puts the Realism LoRA in stage 1, stage 2 or both; 2 tested best (identity 0.366 vs 0.350, sharper faces) |
-| `FACE_REFINE` (1) / `FACE_REFINE_REF` | step 9, FaceRefine + identity guard (default on; `0` = off). Identity from `FACE_REFINE_REF` (default the last `CHAR_REF_FACE` entry); shots that were not generated are skipped. The result before it is kept as `swapped_before_facerefine.mp4`, plus `facerefine_before_after.mp4`. `face_refine.py --guard-margin` (0.08, < 0 = guard off) and `--min-shot` (24) tune the guard. `FACE_REFINE=before` (with `UPSCALE`) refines the 480p shots before the upscale instead; it tested no better |
+| `FACE_REFINE` (1) / `FACE_REFINE_REF` | step 9, FaceRefine + identity guard (default on; `0` = off). Identity from `FACE_REFINE_REF` (default the last `CHAR_REF_FACE` entry); shots that were not generated are skipped. `face_refine.py --guard-margin` (0.08, < 0 = guard off) and `--min-shot` (24) tune the guard. `FACE_REFINE=before` (with `UPSCALE`) refines the 480p shots before the upscale instead; it tested no better |
 | `CROP` | `auto` or `w:h:x:y`: crop constant black bars (pillarbox / letterbox) off the video for generation, pad the result back afterwards |
 | `SOLO_SHOTS` | shots where the target is the only person (the prompt drops the "keep the others" note); automatic for all shots when `PROTECT` is empty |
 | `REALISM` (0.8), `REF_COLOR` (`reinhard_lab:1.0`, empty = no recolouring), `RES` (480), `SEED` (42) | quality settings, as in the pipeline table |
@@ -236,14 +238,29 @@ CASE=cases/<name> FACE_REFINE=0 bash scripts/run_swap.sh       # skip FaceRefine
 CASE=cases/<name> ASSEMBLE_ONLY=1 bash scripts/run_swap.sh     # re-assemble without generating
 ```
 Each run writes to `cases/<name>/output/`:
-- `<OUT>/swapped.mp4` (with the source audio), `<OUT>/side_by_side.mp4` (source | result)
-- `<OUT>/s*.mp4` per shot, `<OUT>/target_check.json` (the per-shot decision)
+- `<OUT>/swapped.mp4`: the final video with the source audio. It is the only file kept in `<OUT>`.
+- `<JOB>/target_check.json` and `<JOB>/picks_<OUT>.json`: the per-shot decisions and what was assembled
 - `<JOB>/shotNN/`: the generation (workflow, prompt, recoloured references, lock masks)
+
+## 3b. Web UI: "Swap character" (from Safari on another device)
+`webui.py` (Gradio, dark theme). One workflow: upload a source video, say who to replace, pick a character from
+the library (`characters/<name>/`: cut-out, face photo, description; new ones are added from photos) and press
+**Swap character**. Each run is a new project, Demo 1, Demo 2, ... (`cases/demoN`, outputs in `output/gen` and
+`output/final`). The result is the final video plus its list of shots; select a swapped shot, type an instruction
+("softer smile, she looks down") and **Re-render shot**: only that shot is generated again (the instruction is
+appended to its prompt via `output/gen/shot_notes.json`), then the final video is rebuilt.
+Options: keep the video's clothes, 480p test / 720p final, re-light, people to keep unchanged.
+```bash
+bash scripts/start_ui.sh            # http://127.0.0.1:7860, login swap / password in .ui_password
+ssh -N -J <user>@ilab2.cs.rutgers.edu -L 7860:127.0.0.1:7860 <user>@lerna.cs.rutgers.edu   # from a laptop abroad
+```
+Run it inside `tmux` to keep it alive after logging out. `UI_HOST=0.0.0.0` exposes it on the network instead.
 
 ## 4. Files
 ```
 char_swap/
 ├── run_bfs.py, bfs_full.py, assemble_bfs.py   main pipeline (one shot / all shots / assembly)
+├── webui.py   web UI (scripts/start_ui.sh)
 ├── scripts/   run_swap.sh (entry point), setup.sh, download_models.sh, start_comfy.sh
 ├── utils/     comfy_client, tone_match, scene_color, make_char_sheet, make_outfit_ref, sheet_refs, face_refine, ...
 ├── cases/     <name>/input, case.env, output

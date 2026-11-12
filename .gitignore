@@ -23,3 +23,8 @@ cases/*/output/
 # third-party material (not ours to redistribute)
 third_party_review/
 legacy/workflows/
+
+# web UI login
+.ui_password
+cases/*/output/_ui_logs/
+characters/

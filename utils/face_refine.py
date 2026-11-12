@@ -43,7 +43,7 @@ PROMPT = ("{trigger}Close-up of <Subject 1>, the person shown in <Picture 1>: ex
 
 
 def build(video: str, face: str, prompt: str, denoise: float, steps: int, seed: int, realism: float,
-          prefix: str) -> dict:
+          prefix: str, mult_large: float = 0.35) -> dict:
     wf = {
         "unet": {"class_type": "UNETLoader",
                  "inputs": {"unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
@@ -75,7 +75,7 @@ def build(video: str, face: str, prompt: str, denoise: float, steps: int, seed: 
                    "inputs": {"av_latent": ["r2v", 1], "images": ["track", 0], "vae": ["vvae", 0]}},
         "pfd": {"class_type": "H3PerFrameDenoise",
                 "inputs": {"model": ["turbo", 0], "av_latent": ["inject", 0], "transform": ["track", 1],
-                           "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.35,
+                           "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": mult_large,
                            "scale_mode": "absolute_px", "face_px_small": 30.0, "face_px_large": 120.0,
                            "gamma": 1.0, "smooth_frames": 9}},
         "guider": {"class_type": "BasicGuider", "inputs": {"model": ["pfd", 2], "conditioning": ["r2v", 0]}},
@@ -182,6 +182,8 @@ def main() -> None:
     ap.add_argument("--details", default="", help="short face/hair description of the character")
     ap.add_argument("--denoise", type=float, default=0.4)
     ap.add_argument("--steps", type=int, default=8)
+    ap.add_argument("--mult-large", type=float, default=0.35,
+                    help="denoise multiplier for large faces (>120 px); small faces use 1.0")
     ap.add_argument("--realism", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--guard-margin", type=float, default=0.08,
@@ -190,6 +192,11 @@ def main() -> None:
     ap.add_argument("--shots-job", type=Path, default=None,
                     help="shot mode: refine each <job>/shotNN/save_*.mp4 (shots listed in --only, or all)")
     ap.add_argument("--only", default="", help="shot mode: shot numbers to refine")
+    ap.add_argument("--only-needed", action="store_true",
+                    help="refine a shot only if it needs it: median face smaller than --need-face px, or identity to "
+                         "--face-ref below --need-id; large faces that already match are left as generated")
+    ap.add_argument("--need-face", type=float, default=120.0)
+    ap.add_argument("--need-id", type=float, default=0.40)
     ap.add_argument("--guard-only", type=Path, default=None,
                     help="skip ComfyUI: apply the guard to already refined shots s<N>.mp4 in this folder")
     ap.add_argument("--comfy-urls", default="http://127.0.0.1:8188,http://127.0.0.1:8189,http://127.0.0.1:8190")
@@ -232,9 +239,12 @@ def main() -> None:
                             "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", str(p)], check=True)
             shots[i + 1] = p; length[i + 1] = b[i + 1] - b[i]
     import threading
+    import time
+    import numpy as np
+    t_start = time.time()
     guard_lock = threading.Lock()
     ref = None
-    if args.guard_margin >= 0 or args.guard_only:
+    if args.guard_margin >= 0 or args.guard_only or args.only_needed:
         import cv2
         fs = _face_app().get(cv2.imread(str(args.face_ref)))
         if not fs:
@@ -247,6 +257,27 @@ def main() -> None:
 
     def run(i: int) -> Path:
         res = out / f"s{i}.mp4"
+        if args.only_needed and i not in keep and length[i] >= args.min_shot:
+            import cv2
+            fsz, ids = [], []
+            with guard_lock:
+                app = _face_app(); cap = cv2.VideoCapture(str(shots[i])); k = 0
+                while True:
+                    ok, f = cap.read()
+                    if not ok:
+                        break
+                    if k % 4 == 0:
+                        sc = 960 / max(f.shape[:2]); sm = cv2.resize(f, None, fx=sc, fy=sc) if sc < 1 else f
+                        fs = app.get(sm)
+                        if fs:
+                            b = max(fs, key=lambda x: float(np.dot(x.normed_embedding, ref)))
+                            ids.append(float(np.dot(b.normed_embedding, ref))); fsz.append((b.bbox[3] - b.bbox[1]) / min(sc, 1))
+                    k += 1
+            if fsz and np.median(fsz) >= args.need_face and np.median(ids) >= args.need_id:
+                print(f"shot {i}: face {np.median(fsz):.0f}px, identity {np.median(ids):.2f} -> good already, not refined",
+                      flush=True)
+                shutil.copy2(shots[i], out / f"s{i}.mp4")
+                return out / f"s{i}.mp4"
         if i in keep or length[i] < args.min_shot:
             if i not in keep:
                 print(f"shot {i}: {length[i]} frames < --min-shot -> unrefined", flush=True)
@@ -261,7 +292,8 @@ def main() -> None:
         try:
             vname = f"fr_{tag}_s{i}.mp4"
             shutil.copy2(shots[i], inp / vname)
-            wf = build(vname, fname, prompt, args.denoise, args.steps, args.seed, args.realism, f"fr/{tag}_s{i}")
+            wf = build(vname, fname, prompt, args.denoise, args.steps, args.seed, args.realism, f"fr/{tag}_s{i}",
+                       args.mult_large)
             (out / f"workflow_s{i}.json").write_text(json.dumps(wf, indent=2))
             c = cs.Comfy(u)
             pid = c.submit(wf)
@@ -306,12 +338,9 @@ def main() -> None:
                     "-i", str(args.source), "-map", "0:v", "-map", "1:a",
                     "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(final)],
                    check=True)
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(args.clip), "-i", str(final), "-filter_complex",
-                    "[0:v]scale=-2:360[a];[1:v]scale=-2:360[b];[a][b]hstack", "-map", "1:a", "-c:v", "libx264",
-                    "-crf", "18", "-pix_fmt", "yuv420p", str(out / "before_after.mp4")], check=True)
     for p in shots.values():
         p.unlink(missing_ok=True)
-    print(f"FINAL -> {final}")
+    print(f"FINAL -> {final}  ({time.time() - t_start:.0f} s)")
 
 
 if __name__ == "__main__":

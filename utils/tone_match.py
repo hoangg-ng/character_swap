@@ -47,14 +47,24 @@ def person_box(frame: np.ndarray, conf: float = 0.3):
     return person_mask(frame, conf)[1]
 
 
-def tone_frame(src: np.ndarray, gen: np.ndarray, strength: float, feather: float = 0.012) -> np.ndarray:
-    """src and gen have the same size. Returns gen with its person toned like the source person."""
+def tone_frame(src: np.ndarray, gen: np.ndarray, strength: float, feather: float = 0.012,
+               fabric: bool = False) -> np.ndarray:
+    """src and gen have the same size. Returns gen with its person toned like the source person.
+    fabric=True (dark scenes): the toned area also covers every bright, coloured pixel brighter than the source
+    background (flowing sleeves or hair the person silhouette misses, which otherwise glow in a dark shot)."""
     ms_, _ = person_mask(src)
     mg_, bg = person_mask(gen)
     if ms_ is None or mg_ is None or ms_.sum() < 50 or mg_.sum() < 50:
         return gen
     ls = cv2.cvtColor(src, cv2.COLOR_BGR2LAB)[ms_].astype(np.float32)
     lab = cv2.cvtColor(gen, cv2.COLOR_BGR2LAB).astype(np.float32)
+    if fabric:
+        slab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB)
+        bg_l = np.percentile(slab[~ms_][:, 0], 90) if (~ms_).any() else 255
+        chroma = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
+        h0, w0 = gen.shape[:2]; g0 = max(1, int(0.04 * max(h0, w0)))
+        mg_ = (cv2.dilate(mg_.astype(np.uint8), np.ones((2 * g0 + 1, 2 * g0 + 1), np.uint8)) > 0) | \
+              ((chroma > 20) & (lab[..., 0] > bg_l))
     lg = lab[mg_]
     ms, ss, mg, sg = ls.mean(0), ls.std(0) + 1e-3, lg.mean(0), lg.std(0) + 1e-3
     toned = (lab - mg) / sg * ss + ms

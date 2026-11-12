@@ -55,6 +55,13 @@
 #                 Realism in the upscale pass (FaceRefine works best while the face is small)
 #   REF_COLOR_SCENE (1 = default)  take the reference colour statistics from the scene only (people masked out), so the
 #                 replaced person's clothes do not tint the character; 0 = whole frames (old)       [1]
+#   RELIGHT       0-1: re-light generated shots with the source's broad light (utils/relight.py) instead of
+#                 TONE_PERSON; silhouettes are then generated too (MIN_PERSON_LIGHT 0)              [0]
+#   AUTO_RETRY    after generation, shots whose face matches the original person more than the character are
+#                 re-rendered with the next seed, up to this many times; the best attempt is kept (utils/identity_check.py).
+#                 Off by default: the check always runs and warns, SOFT_FACE is the actual fix          [0]
+#   SOFT_FACE     soften the original person's face in the guide video (identity removed, pose and coarse expression
+#                 kept), so the model cannot copy the original face in close-ups                     [1]
 #   FACE_REFINE_REF  face photo for FaceRefine's identity reference                      [last CHAR_REF_FACE entry]
 #   SOLO_SHOTS    shots where the target is the only person (no "keep the others" prompt note)    [""]
 #   REALISM (0.8)  REF_COLOR (reinhard_lab:1.0)  RES (480|720)  SEED (42)  MIN_TARGET (0.1)
@@ -99,7 +106,7 @@ x0+=x0%2; y0+=y0%2; w=(x1-x0)//2*2; h=(y1-y0)//2*2
 print(f'{w}:{h}:{x0}:{y0}' if (w,h)!=(len(mc),len(mr)) else '')")
   fi
   if [ -n "$CROP" ]; then
-    mkdir -p "$CHAR_SWAP_OUT"; CV="$CHAR_SWAP_OUT/_source_cropped.mp4"
+    mkdir -p "$CHAR_SWAP_OUT"; CV="$CHAR_SWAP_OUT/_source_cropped_$(basename "${VIDEO%.*}").mp4"   # one cache per source file
     [ -s "$CV" ] || ffmpeg -y -loglevel error -i "$VIDEO" -vf "crop=$CROP" -c:v libx264 -crf 10 -pix_fmt yuv420p -c:a copy "$CV"
     read VW VH < <(ffprobe -v error -select_streams v -show_entries stream=width,height -of csv=p=0 "$VIDEO" | tr ',' ' ')
     IFS=: read cw ch cx cy <<< "$CROP"; VIDEO="$CV"
@@ -125,7 +132,7 @@ print(round(max(1.0, $H*u/h), 4) if u>1 else 1.0)")
 # Rendered once (utils/make_char_sheet.py, grid mode) into SHEET_OUTFIT_DIR / SHEET_OWN_DIR (default
 # input/sheet_<name>_outfit | _own) and reused; utils/sheet_refs.py assigns the panels to CHAR_REF /
 # CHAR_REF_EXTRA / CHAR_REF_FACE, and SHEET_FACE becomes the FaceRefine identity.
-if [ -n "${SHEET_PERSON:-}" ] && [ "${ASSEMBLE_ONLY:-0}" != 1 ]; then
+if [ -n "${SHEET_PERSON:-}" ]; then
   SP=$(abspath "$SHEET_PERSON"); SO_FACE=$(abspath "${SHEET_FACE:-}")
   NAME=$(basename "${SP%.*}"); NAME=${NAME%_cutout}; NAME=${NAME%_full_body}
   if [ "$KEEP_OUTFIT" = 1 ]; then
@@ -134,7 +141,7 @@ if [ -n "${SHEET_PERSON:-}" ] && [ "${ASSEMBLE_ONLY:-0}" != 1 ]; then
   else
     SO_DIR=$(abspath "${SHEET_OWN_DIR:-input/sheet_${NAME}_own}")
   fi
-  if ! ls "$SO_DIR"/view_panel*.png >/dev/null 2>&1; then
+  if [ "${ASSEMBLE_ONLY:-0}" != 1 ] && ! ls "$SO_DIR"/view_panel*.png >/dev/null 2>&1; then
     SHEET_ARGS=(--person "$SP" --face "${SO_FACE:-$SP}" --out "$SO_DIR")
     if [ "$KEEP_OUTFIT" = 1 ]; then
       echo "[sheet] character sheet of $NAME in the video's outfit -> $SO_DIR"
@@ -183,12 +190,30 @@ if [ "${ASSEMBLE_ONLY:-0}" != 1 ]; then
   [ -n "${CHAR_REF_BACK:-}" ] && ARGS+=(--ref-back "$(abspath "$CHAR_REF_BACK")")
   [ "$UPSCALE" != 0 ] && ARGS+=(--upscale "$UPSCALE" --realism-stage "$REALISM_STAGE")
   [ "$LIGHT_MATCH" = 1 ] && ARGS+=(--light-match)
+  [ -f "$W_DIR/shot_edits.json" ] && ARGS+=(--shot-notes "$W_DIR/shot_edits.json")   # per-shot edits (web UI)
+  [ "${SOFT_FACE:-1}" = 1 ] && [ "$FACE_ONLY" != 1 ] && ARGS+=(--soften-face --soft-face-scale "${SOFT_FACE_SCALE:-0.15}")
+  [ "${FACE_LEAD:-0}" = 1 ] && ARGS+=(--face-lead)
+  # with RELIGHT, silhouettes are generated (re-lighting keeps them dark, with the new character's outline)
+  ARGS+=(--min-person-light "${MIN_PERSON_LIGHT:-$([ "${RELIGHT:-0}" != 0 ] && echo 0 || echo 6)}")
   [ "${REF_COLOR_SCENE:-1}" = 1 ] && [ -n "$REF_COLOR" ] && ARGS+=(--ref-color-scene --ref-color-mode "${REF_COLOR_MODE:-scene}")
   [ "$FACE_ONLY" = 1 ] && [ -z "$PROTECT" ] && ARGS+=(--face-only --subject "face" --mask-grow "$FACE_GROW")
   [ "${CHECK_ONLY:-0}" = 1 ] && ARGS+=(--check-only)
   $PY -u bfs_full.py "${ARGS[@]}" 2>&1 | grep -v -E "running\.\.\.|^\s*$"
   [ "${CHECK_ONLY:-0}" = 1 ] && exit 0
   echo "[bfs] finished"
+  # identity check + retry: a shot whose face looks more like the original person than the new character (the model
+  # kept the original face, typical for short close-ups) is re-rendered with the next seed; the best attempt is kept
+  ID_REF="${SHEET_FACE:+$(abspath "$SHEET_FACE")}"; [ -z "$ID_REF" ] && ID_REF="${FACE_REFINE_REF:-}"
+  [ -z "$ID_REF" ] && for x in ${CHAR_REF_FACE:-}; do ID_REF="$x"; done; ID_REF=$(abspath "${ID_REF:-$CHAR_REF}")
+  [ "${CHECK_ONLY:-0}" != 1 ] && BAD=$($PY utils/identity_check.py --job "$W_DIR" --face-ref "$ID_REF" --report 2>/dev/null | tail -1)
+  [ -n "${BAD:-}" ] && echo "[identity] WARNING: shot(s) $BAD look more like the original person than the character"
+  for r in $(seq 1 "${AUTO_RETRY:-0}"); do
+    [ -z "${BAD:-}" ] && break
+    echo "[identity] original face kept in shot(s) $BAD -> retry $r with seed $((SEED + r))"
+    $PY -u bfs_full.py "${ARGS[@]}" --only "$BAD" --seed $((SEED + r)) 2>&1 | grep -E "shot [0-9]+: (done|FAILED)"
+    $PY utils/identity_check.py --job "$W_DIR" --face-ref "$ID_REF" --keep-best "$BAD" 2>&1 | grep -E "keeping"
+    BAD=$($PY utils/identity_check.py --job "$W_DIR" --face-ref "$ID_REF" --report 2>/dev/null | tail -1)
+  done
 fi
 # assemble: only the shots the target check approved; the rest come from the source
 CUTS_USED=$(cat "$W_DIR/cuts.txt")
@@ -196,6 +221,8 @@ GEN=$($PY -c "import json;d=json.load(open('$W_DIR/target_check.json'));print(' 
 SHOTS=""
 for s in $GEN; do d="$W_DIR/shot$(printf %02d $s)"; ls "$d"/save_*.mp4 >/dev/null 2>&1 && SHOTS="$SHOTS --shot $s=$d" || echo "  shot $s: no result -> source"; done
 if [ "$FACE_ONLY" = 1 ]; then ASM=(--color-match --feather 4); else ASM=(--raw --letterbox --tone-person "$TONE_PERSON"); fi
+[ "${RELIGHT:-0}" != 0 ] && [ "$FACE_ONLY" != 1 ] && ASM+=(--relight "$RELIGHT")
+[ -f "$W_DIR/shot_edits.json" ] && ASM+=(--shot-edits "$W_DIR/shot_edits.json")
 if [ "$OSCALE" != 1.0 ]; then
   ASM+=(--size "$($PY -c "
 import cv2; c=cv2.VideoCapture('$VIDEO'); s=$OSCALE; print(f'{int(c.get(3)*s)//2*2}x{int(c.get(4)*s)//2*2}')")")
@@ -205,15 +232,11 @@ if [ -n "$SPLICE" ]; then
   for sp in $SPLICE; do n=${sp%%=*}; f=$(abspath "${sp#*=}"); cp "$f" "$O_DIR/s$n.mp4"; echo "  shot $n: spliced from $f"; done
   ffmpeg -y -loglevel error -f concat -safe 0 -i "$O_DIR/list.txt" -i "$VIDEO" -map 0:v -map 1:a -c:v libx264 -crf 16 \
     -pix_fmt yuv420p -c:a aac -shortest "$O_DIR/swapped.mp4"
-  ffmpeg -y -loglevel error -i "$VIDEO" -i "$O_DIR/swapped.mp4" -filter_complex \
-    "[0:v]scale=-2:360[a];[1:v]scale=-2:360[b];[a][b]hstack" -map 1:a -c:v libx264 -crf 18 -pix_fmt yuv420p "$O_DIR/side_by_side.mp4"
 fi
 if [ -n "$CROP" ] && [ -n "${VW:-}" ]; then   # restore the original frame (x OSCALE) with the black bars
   PAD=$($PY -c "s=$OSCALE; e=lambda v:int(v*s)//2*2; print(f'pad={e($VW)}:{e($VH)}:{e($cx)}:{e($cy)}:black')")
   ffmpeg -y -loglevel error -i "$O_DIR/swapped.mp4" -vf "$PAD" -c:v libx264 -crf 16 -pix_fmt yuv420p -c:a copy "$O_DIR/_padded.mp4" \
     && mv "$O_DIR/_padded.mp4" "$O_DIR/swapped.mp4"
-  ffmpeg -y -loglevel error -i "$SRC_VIDEO" -i "$O_DIR/swapped.mp4" -filter_complex \
-    "[0:v]scale=-2:360[a];[1:v]scale=-2:360[b];[a][b]hstack" -map 1:a -c:v libx264 -crf 18 -pix_fmt yuv420p "$O_DIR/side_by_side.mp4"
 fi
 cp "$W_DIR/target_check.json" "$O_DIR/" 2>/dev/null
 echo "[assembled] $O_DIR/swapped.mp4"
@@ -238,10 +261,13 @@ print(','.join(map(str, cuts)), ','.join(keep) or '-')")
   [ "$REALISM" != 0 ] && FR_ARGS+=(--realism "$REALISM")
   echo "[facerefine] ref=$(basename "$FR_REF") keep=${FR_KEEP:-none}"
   if $PY -u utils/face_refine.py "${FR_ARGS[@]}" 2>&1 | grep -E --line-buffered "SKIPPED|FAILED|FINAL"; then
-    mv "$O_DIR/swapped.mp4" "$O_DIR/swapped_before_facerefine.mp4"
     cp "$O_DIR/_facerefine/swapped.mp4" "$O_DIR/swapped.mp4"
-    cp "$O_DIR/_facerefine/before_after.mp4" "$O_DIR/facerefine_before_after.mp4" 2>/dev/null
-    rm -rf "$O_DIR/_facerefine"
-    echo "[facerefine] done -> $O_DIR/swapped.mp4 (before: swapped_before_facerefine.mp4)"
+    echo "[facerefine] done"
   fi
+  rm -rf "${O_DIR:?}/_facerefine"
 fi
+
+# the result folder keeps only the final video; the per-shot decisions go to the render folder (JOB)
+[ -f "$O_DIR/picks.json" ] && mv "$O_DIR/picks.json" "$W_DIR/picks_$OUT.json"
+for f in "$O_DIR"/*; do [ "$(basename "$f")" = swapped.mp4 ] || rm -rf "${f:?}"; done
+echo "[done] $O_DIR/swapped.mp4"
